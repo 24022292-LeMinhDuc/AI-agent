@@ -1,0 +1,19 @@
+# Các giá trị cấu hình dưới đây là giả định mẫu, cần được kiểm chứng.
+tariff_vnd_per_kwh: 2500 # GIẢ ĐỊNH - cần kiểm chứng
+emission_factor_kg_per_kwh: null # TODO: xác minh hệ số phát thải phù hợp; GIẢ ĐỊNH - cần kiểm chứng
+cdd_base_temp_c: 24 # GIẢ ĐỊNH - cần kiểm chứng
+seu_threshold: 0.8 # GIẢ ĐỊNH - cần kiểm chứng
+
+opportunities:
+  - name: Tối ưu hệ thống chiller # GIẢ ĐỊNH - cần kiểm chứng
+    applies_to: kwh_chiller # GIẢ ĐỊNH - cần kiểm chứng
+    saving_pct: 0.10 # GIẢ ĐỊNH - cần kiểm chứng
+    capex_vnd: 100000000 # GIẢ ĐỊNH - cần kiểm chứng
+  - name: Tối ưu hệ thống khí nén # GIẢ ĐỊNH - cần kiểm chứng
+    applies_to: kwh_compressed_air # GIẢ ĐỊNH - cần kiểm chứng
+    saving_pct: 0.08 # GIẢ ĐỊNH - cần kiểm chứng
+    capex_vnd: 50000000 # GIẢ ĐỊNH - cần kiểm chứng
+  - name: Nâng cấp hệ thống chiếu sáng # GIẢ ĐỊNH - cần kiểm chứng
+    applies_to: kwh_lighting # GIẢ ĐỊNH - cần kiểm chứng
+    saving_pct: 0.12 # GIẢ ĐỊNH - cần kiểm chứng
+    capex_vnd: 30000000 # GIẢ ĐỊNH - cần kiểm chứng
