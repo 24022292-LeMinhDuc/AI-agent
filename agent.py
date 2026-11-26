@@ -89,14 +89,16 @@ def run_tool(name: str, args: dict[str, Any], store: dict[str, Any]) -> dict[str
                 raise ValueError("store cần có DataFrame đã nạp.")
             total_col = args["total_col"]
             enpi_df = analysis_df
-            if total_col == "kwh_total" and total_col not in analysis_df.columns:
+            if total_col == energy_tools.TOTAL_METER:
                 kwh_cols = [
                     column
                     for column in analysis_df.columns
                     if str(column).startswith("kwh_")
                 ]
-                enpi_df = analysis_df.copy()
-                enpi_df[total_col] = energy_tools.total_kwh(enpi_df, kwh_cols, require_complete=True)
+                if energy_tools.total_meter_columns(analysis_df, kwh_cols) != [total_col]:
+                    enpi_df = analysis_df.assign(
+                        kwh_total=energy_tools.total_kwh(analysis_df, kwh_cols, require_complete=True)
+                    )
             result = energy_tools.enpi_regression(enpi_df, total_col, args["drivers"])
         elif name == "energy_baseline":
             if not isinstance(source_df, pd.DataFrame) or (
@@ -104,8 +106,9 @@ def run_tool(name: str, args: dict[str, Any], store: dict[str, Any]) -> dict[str
             ):
                 raise ValueError("Cần dữ liệu đo đã ánh xạ trước khi làm sạch. Hãy xác nhận lại dữ liệu nguồn.")
             meter = args["energy_col"]
-            if meter == "kwh_total" and meter not in source_df.columns:
-                kwh_cols = [column for column in source_df.columns if str(column).startswith("kwh_")]
+            if meter == energy_tools.TOTAL_METER:
+                mapped_cols = [column for column in source_df.columns if str(column).startswith("kwh_")]
+                kwh_cols = energy_tools.total_meter_columns(source_df, mapped_cols)
             else:
                 kwh_cols = [meter]
             result = normalized_baseline(

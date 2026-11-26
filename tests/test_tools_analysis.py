@@ -362,6 +362,37 @@ def test_authoritative_total_preserves_missing_and_excludes_submeter_double_coun
     assert seu_pareto(df, ["kwh_total"], 0.8).empty
 
 
+def test_empty_total_column_uses_submeters_without_switching_source_by_period() -> None:
+    """Cột công tơ tổng để trống cả tệp khác với một kỳ thiếu số đo."""
+    df = pd.DataFrame({
+        "timestamp": ["2026-01-01", "2026-02-01"],
+        "facility_type": ["Toa_nha", "Toa_nha"],
+        "floor_area_m2": [100, 100],
+        "kwh_total": [None, None],
+        "kwh_chiller": [100, 110],
+        "kwh_lighting": [20, 22],
+    })
+    columns = ["kwh_total", "kwh_chiller", "kwh_lighting"]
+    dataset = dataset_summary(df, columns)
+    assert dataset["total_source"] == "submeter_sum"
+    assert dataset["total_kwh"] == 252
+    assert dataset["energy_rows_by_column"]["kwh_total"] == 0
+    assert np.isclose(dataset["reported_audit"]["building_eui"]["kwh_per_m2"], 2.52)
+    assert compare_periods(df, "2026-01", "2026-02", columns)["total_kwh_difference"] == 12
+
+    february = dashboard_analysis(df, "day", columns, "2026-02-01", "2026-02-01", 2)
+    assert february["summary"]["total_kwh"] == 132
+    assert february["aggregated"]["kwh_total"].tolist() == [132]
+
+    df["kwh_total"] = [200, None]
+    february = dashboard_analysis(df, "day", columns, "2026-02-01", "2026-02-01", 2)
+    assert february["summary"]["total_source"] == "metered_total"
+    assert february["summary"]["total_kwh"] is None
+    assert february["summary"]["energy_rows_by_column"]["kwh_chiller"] == 1
+    assert pd.isna(february["aggregated"]["kwh_total"].iloc[0])
+    assert compare_periods(df, "2026-01", "2026-02", columns)["total_kwh_difference"] is None
+
+
 def test_building_audit_uses_paired_cooling_and_keeps_reported_carbon_separate() -> None:
     """Tổng hợp số đã ghi và tính chiller/EUI theo các dòng ghép hợp lệ."""
     df = pd.DataFrame({

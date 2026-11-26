@@ -25,7 +25,7 @@ Cách tổ chức số liệu, hồi quy, biểu đồ và báo cáo tham khảo
 
 ## Dữ liệu đầu vào
 
-- Dùng điện năng tiêu thụ theo khoảng đo. Với số đọc công tơ lũy kế hoặc công suất, chuyển đổi sang kWh theo khoảng đo trước khi nhập. Biểu đồ phụ tải và SEU sử dụng các công tơ thành phần có ranh giới độc lập. Điện tổng ưu tiên công tơ tổng khi cột này được ánh xạ.
+- Dùng điện năng tiêu thụ theo khoảng đo. Với số đọc công tơ lũy kế hoặc công suất, chuyển đổi sang kWh theo khoảng đo trước khi nhập. Biểu đồ phụ tải và SEU sử dụng các công tơ thành phần có ranh giới độc lập. Ứng dụng chọn ranh giới điện tổng cho toàn bộ tệp. Khi công tơ tổng có số đo hợp lệ, các khoảng thiếu của công tơ đó được giữ trống. Khi toàn tệp thiếu công tơ tổng hoặc cột này chưa có số đo hợp lệ, điện tổng dùng các phụ tải có số đo.
 - Với tòa nhà có diện tích sàn nhất quán, cường độ điện theo kỳ bằng kWh đã ghép với diện tích chia cho diện tích sàn. EUI năng lượng theo định nghĩa ENERGY STAR dùng năng lượng cả năm và diện tích sàn. [ENERGY STAR về EUI](https://www.energystar.gov/buildings/benchmark/understand-metrics/what-eui)
 - SEC, EnB tham chiếu và hệ số phát thải có thể được khai báo như các cột của tệp. Tổng phát thải trong báo cáo lấy từ dữ liệu khai báo. Phạm vi Scope 2 cần xác định điện hoặc năng lượng mua ngoài. [GHG Protocol Scope 2](https://ghgprotocol.org/scope-2-guidance)
 - Ngày giờ có độ lệch UTC được quy về giờ Việt Nam. Ngày có dấu gạch chéo được đọc theo thứ tự ngày/tháng/năm. Dashboard có thể xem theo ngày, tuần bắt đầu thứ Hai hoặc tháng.

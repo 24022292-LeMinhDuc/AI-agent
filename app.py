@@ -38,7 +38,7 @@ from report import (
     render_markdown,
     render_report_json,
 )
-from tools import submeter_columns
+from tools import TOTAL_METER, submeter_columns, total_meter_columns
 from weather_panel import show_hourly_weather
 
 
@@ -531,11 +531,11 @@ def _show_dashboard(store: dict[str, Any]) -> None:
     if summary.get("average_temp_c") is not None:
         kpis.append(("Nhiệt độ trung bình (°C)", _format_value(summary["average_temp_c"])))
     if not kpis:
-        st.info("Khoảng ngày đã chọn không có số đo điện hợp lệ để hiển thị KPI.")
-        return
-    with st.container(key="ve_dashboard_metrics"):
-        for column, (label, value) in zip(st.columns(len(kpis)), kpis):
-            column.metric(label, value, border=True)
+        st.info("Khoảng ngày đã chọn chưa có giá trị cho các KPI tổng quan.")
+    else:
+        with st.container(key="ve_dashboard_metrics"):
+            for column, (label, value) in zip(st.columns(len(kpis)), kpis):
+                column.metric(label, value, border=True)
     cost = summary.get("estimated_cost_vnd")
     if cost is not None:
         st.caption(
@@ -549,7 +549,10 @@ def _show_dashboard(store: dict[str, Any]) -> None:
     if summary.get("total_source") == "metered_total":
         st.caption("Điện tổng lấy từ cột công tơ tổng. Biểu đồ cột thể hiện các phụ tải.")
     elif summary.get("total_source") == "submeter_sum":
-        st.caption("Điện tổng là tổng các phụ tải có số đo trong phạm vi đã ánh xạ.")
+        if TOTAL_METER in df:
+            st.caption("Tệp chưa có số đo hợp lệ ở công tơ tổng. Điện tổng được tính từ các phụ tải có số đo.")
+        else:
+            st.caption("Điện tổng được tính từ các phụ tải có số đo trong phạm vi đã ánh xạ.")
     if audit := summary.get("reported_audit"):
         rows = audit_summary_rows(audit)
         if rows:
@@ -1015,9 +1018,11 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
         )
         scope = store["run_scope_id"]
         filters = store.setdefault("baseline_filters", {})
-        mapped_meters = submeter_columns([column for column in df if column.startswith("kwh_")])
+        kwh_cols = [column for column in df if column.startswith("kwh_")]
+        mapped_meters = submeter_columns(kwh_cols)
+        uses_total_meter = total_meter_columns(df, kwh_cols) == [TOTAL_METER]
         meter_labels = {
-            "kwh_total": "Công tơ tổng" if "kwh_total" in df else "Tổng các phụ tải đã ánh xạ",
+            "kwh_total": "Công tơ tổng" if uses_total_meter else "Tổng các phụ tải đã ánh xạ",
             **{meter: CATEGORY_LABELS.get(meter, meter) for meter in mapped_meters},
         }
         boundary_column, driver_column = st.columns(2)
@@ -1039,7 +1044,7 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
                 key=f"baseline_drivers_{scope}",
             )
         if energy_col == "kwh_total":
-            if "kwh_total" in df:
+            if uses_total_meter:
                 st.caption("Đường cơ sở dùng số đo công tơ tổng tại các ngày đủ biến đã chọn.")
             else:
                 st.caption("Mỗi ngày dùng tính tổng cần đủ số đo các phụ tải đã ánh xạ.")

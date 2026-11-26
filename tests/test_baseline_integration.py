@@ -22,8 +22,9 @@ BASELINE_ARGS = {
 }
 
 
+@pytest.mark.parametrize("has_empty_total_meter", [False, True])
 def test_baseline_uses_measured_data_and_persists_report_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, has_empty_total_meter: bool,
 ) -> None:
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
     measured = pd.DataFrame({
@@ -32,6 +33,8 @@ def test_baseline_uses_measured_data_and_persists_report_evidence(
         "kwh_chiller": [102, 104, 106, 108, 110, 112, 94, 96, None, 100],
         "kwh_lighting": [20] * 10,
     })
+    if has_empty_total_meter:
+        measured["kwh_total"] = float("nan")
     store = {
         "df": measured,
         "mapping_confirmed": True,
@@ -58,6 +61,9 @@ def test_baseline_uses_measured_data_and_persists_report_evidence(
     store["baseline_args"] = BASELINE_ARGS
     store["analysis_results"] = {"energy_baseline": response}
     report_data = build_report_data(store)
+    assert report_data["metadata"]["total_source"] == "submeter_sum"
+    assert report_data["enpi_analysis"]["result"]["intensity_rows"] == 10
+    assert report_data["enpi_analysis"]["result"]["kwh_per_ton"] > 0
     assert report_data["energy_baseline"]["run_id"] == response["run_id"]
     assert response["run_id"] in report_data["run_ids"]
     assert "Chênh lệch ước tính (kWh) | 30.00" in render_markdown(report_data, "Tổng hợp.")

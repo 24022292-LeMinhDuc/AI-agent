@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
 
@@ -38,6 +38,34 @@ def test_sample_loader_and_dedicated_report_page(monkeypatch, tmp_path: Path) ->
     archive = json.loads(app.session_state["store"]["report_export"]["json"])
     assert archive["metadata"]["source_file"] == "sample_a.csv"
     assert archive["run_ids"]
+
+
+def test_dashboard_keeps_submeter_and_audit_data_when_period_has_no_total(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Một kỳ thiếu điện tổng vẫn hiển thị phụ tải và chi phí khai báo."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+    content = (
+        b"Ngay,Tong_dien_tieu_thu_kWh,Dien_chiller_kWh,Chi_phi_nang_luong_VND\n"
+        b"2026-01-01,200,100,450000\n"
+        b"2026-02-01,,110,275000\n"
+    )
+    app.file_uploader[0].set_value(("meter_gaps.csv", content, "text/csv")).run()
+    store = app.session_state["store"]
+    app.button(key=f"confirm_{store['upload_fingerprint']}").click().run()
+    app.button(key="nav_2_Dashboard").click().run()
+    store = app.session_state["store"]
+    date_key = f"dashboard_dates_{store['decision_scope_id']}"
+    february = date(2026, 2, 1)
+    app.date_input(key=date_key).set_value((february, february)).run()
+
+    assert not app.exception
+    assert any(panel.label == "Vận hành, nhiệt và phát thải" for panel in app.expander)
+    assert app.get("plotly_chart")
+    result = app.session_state["store"]["analysis_results"]["dashboard"]["result"]
+    assert result["summary"]["total_kwh"] is None
+    assert result["summary"]["reported_audit"]["energy_cost_vnd"]["value"] == 275000
 
 
 def test_replacing_invalid_dataset_never_leaves_previous_dataset_active(
