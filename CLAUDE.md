@@ -7,6 +7,6 @@ NGUYÊN TẮC BẤT BIẾN:
 (5) Tỷ lệ tiết kiệm, giá điện, vốn đầu tư là GIẢ ĐỊNH, luôn gắn nhãn đó khi hiển thị.
 (6) ROI (%) và thời gian hoàn vốn (tháng) là hai chỉ số riêng.
 (7) Không hardcode API key; đọc từ GEMINI_API_KEY.
-TÊN CỘT CHUẨN sau mapping: timestamp, production_t, temp_c, kwh_production, kwh_chiller, kwh_compressed_air, kwh_lighting. Mọi cột điện bắt đầu bằng "kwh_". Cột cdd được tính từ temp_c và cdd_base_temp_c.
+TÊN CỘT CHUẨN sau mapping được khai báo trong mapping.py. Các cột điện năng bắt đầu bằng "kwh_". Cột kwh_total dành cho công tơ tổng. Cột cdd được tính từ temp_c và cdd_base_temp_c.
 QUY ƯỚC: type hints; docstring tiếng Việt ngắn; hàm trong tools.py là hàm thuần, không I/O; mỗi hàm có test pytest trong tests/; cấu hình Gemini tập trung tại gemini_service.py, model mặc định "gemini-3.8-flash".
 MỖI PHIÊN: làm đúng một việc, chạy pytest, tóm tắt các file đã đổi.

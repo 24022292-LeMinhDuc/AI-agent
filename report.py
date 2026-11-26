@@ -18,6 +18,7 @@ from google.genai import types
 
 import db
 from agent import run_tool
+from energy_baseline import BASELINE_DRIVER_LABELS
 from gemini_service import create_client, generate_content
 
 
@@ -61,7 +62,8 @@ def build_report_data(store: dict[str, Any]) -> dict[str, Any]:
     config = store.get("config", {})
     threshold = float(store.get("seu_threshold_value", config.get("seu_threshold", 0.8)))
     default_drivers = ["production_t", "cdd"]
-    available_drivers = [column for column in default_drivers if column in df.columns]
+    present_drivers = [column for column in default_drivers if column in df]
+    available_drivers = [column for column in present_drivers if df[column].nunique() > 1] or present_drivers
     drivers = store.get("enpi_drivers") or available_drivers or default_drivers
     analysis_results = store.setdefault("analysis_results", {})
     specs = {
@@ -142,7 +144,7 @@ def build_report_data(store: dict[str, Any]) -> dict[str, Any]:
         ]
     )
     if config.get("emission_factor_kg_per_kwh") is None:
-        assumptions.append("Hệ số phát thải chưa cấu hình nên không tính CO₂.")
+        assumptions.append("Các cơ hội tiết kiệm cần hệ số phát thải cấu hình để ước tính CO₂e tránh phát thải.")
 
     report_data = {
         "metadata": {
@@ -155,6 +157,8 @@ def build_report_data(store: dict[str, Any]) -> dict[str, Any]:
             "rows": scope.get("rows"),
             "valid_timestamp_rows": scope.get("valid_timestamp_rows"),
             "total_kwh": scope.get("total_kwh"),
+            "total_source": scope.get("total_source"),
+            "energy_reconciliation": scope.get("energy_reconciliation"),
             "interval_quality": scope.get("interval_quality", {}),
             "dataset_run_id": runs["scope"]["run_id"],
             "column_mapping": store.get("confirmed_mapping", {}),
@@ -186,6 +190,8 @@ def build_report_data(store: dict[str, Any]) -> dict[str, Any]:
         "run_ids": [run["run_id"] for run in tool_runs],
         "tool_runs": tool_runs,
     }
+    if audit := scope.get("reported_audit"):
+        report_data["reported_audit"] = audit
     if baseline_run := runs.get("energy_baseline"):
         report_data["energy_baseline"] = {
             "run_id": baseline_run["run_id"],
@@ -257,6 +263,40 @@ def _format_percent(value: float | None) -> str:
     return "—" if value is None else f"{value:.2%}"
 
 
+def audit_summary_rows(audit: dict[str, Any]) -> list[tuple[str, float, int]]:
+    """Tạo các dòng có đơn vị và số bản ghi dùng tính cho bảng kiểm toán."""
+    labels = {
+        "operating_hours": "Giờ vận hành (h)",
+        "peak_demand_kw": "Công suất cực đại (kW)",
+        "power_factor_mean": "Hệ số công suất trung bình",
+        "steam_t": "Sản lượng hơi (tấn)",
+        "energy_cost_vnd": "Chi phí năng lượng từ tệp (VNĐ)",
+        "scope1_tco2e": "Scope 1 từ tệp (tCO₂e)",
+        "scope2_tco2e": "Scope 2 từ tệp (tCO₂e)",
+        "total_emissions_tco2e": "Tổng phát thải từ tệp (tCO₂e)",
+    }
+    rows = [
+        (label, audit[field]["value"], audit[field]["rows"])
+        for field, label in labels.items()
+        if field in audit and audit[field].get("value") is not None
+    ]
+    for fuel, item in audit.get("boiler_fuel_kg_by_type", {}).items():
+        if item.get("value") is not None:
+            rows.append((f"Nhiên liệu lò hơi {fuel} (kg)", item["value"], item["rows"]))
+    if eui := audit.get("building_eui"):
+        rows.extend((
+            ("Diện tích sàn (m²)", eui["floor_area_m2"], eui["paired_rows"]),
+            ("Cường độ điện tòa nhà trong kỳ (kWh/m²)", eui["kwh_per_m2"], eui["paired_rows"]),
+        ))
+    if chiller := audit.get("chiller"):
+        rows.extend((
+            ("Tải lạnh chiller ghép với số điện (RTh)", chiller["cooling_load_rth"], chiller["paired_rows"]),
+            ("Suất điện chiller (kW/RT)", chiller["kw_per_rt"], chiller["paired_rows"]),
+            ("COP chiller", chiller["cop"], chiller["paired_rows"]),
+        ))
+    return rows
+
+
 def _baseline_report_blocks(baseline_run: dict[str, Any]) -> list[_ReportBlock]:
     """Trình bày đường cơ sở từ đúng kết quả đã lưu."""
     args = baseline_run["args"]
@@ -266,9 +306,8 @@ def _baseline_report_blocks(baseline_run: dict[str, Any]) -> list[_ReportBlock]:
         blocks.append(result["error"])
         return blocks
 
-    driver_labels = {"production_t": "Sản lượng (tấn)", "cdd": "CDD"}
     scope = ", ".join(result.get("meter_columns", [args["energy_col"]]))
-    drivers = ", ".join(driver_labels[driver] for driver in args["drivers"])
+    drivers = ", ".join(BASELINE_DRIVER_LABELS[driver] for driver in args["drivers"])
     blocks.append(f"Cột điện đo · {scope}. Biến hồi quy · {drivers}.")
     coverage_rows = [
         [
@@ -318,6 +357,16 @@ def _report_sections(
     ]
     if metadata.get("source_sheet"):
         scope_rows.insert(2, ["Trang tính", metadata["source_sheet"]])
+    if metadata.get("total_source") == "metered_total":
+        scope_rows.append(["Nguồn điện tổng", "Công tơ tổng trong tệp"])
+    elif metadata.get("total_source") == "submeter_sum":
+        scope_rows.append(["Nguồn điện tổng", "Tổng các phụ tải có số đo"])
+    if reconciliation := metadata.get("energy_reconciliation"):
+        scope_rows.extend((
+            ["Dòng đối chiếu có đủ số liệu", str(reconciliation["paired_rows"])],
+            ["Điện tổng trừ tổng phụ tải trên các dòng đối chiếu (kWh)",
+             _format_number(reconciliation["residual_kwh"])],
+        ))
     interval_quality = metadata.get("interval_quality", {})
     if interval_quality.get("duplicate_rows_removed"):
         scope_rows.append(["Dòng lặp đã bỏ", str(interval_quality["duplicate_rows_removed"])])
@@ -343,6 +392,7 @@ def _report_sections(
     seu = report_data["seu_analysis"]
     seu_blocks: list[_ReportBlock] = [
         f"Lần tính SEU {seu.get('run_id', '—')} · Ngưỡng tích lũy {_format_percent(seu.get('threshold'))}",
+        "Tỷ trọng dùng tổng điện của các phụ tải có số đo làm mẫu số.",
     ]
     if seu.get("error"):
         seu_blocks.append(seu["error"])
@@ -450,6 +500,14 @@ def _report_sections(
             "Đường cơ sở năng lượng và chênh lệch ước tính",
             _baseline_report_blocks(baseline_run),
         ))
+    audit_rows = audit_summary_rows(report_data.get("reported_audit", {}))
+    if audit_rows:
+        sections.insert(2, ("Vận hành, nhiệt và phát thải", [
+            "Chi phí và phát thải tổng hợp từ các giá trị đã khai báo trong tệp.",
+            _Table(["Chỉ số", "Giá trị", "Dòng dùng tính"], [
+                [name, _format_number(value, 3), str(count)] for name, value, count in audit_rows
+            ]),
+        ]))
     return sections
 
 

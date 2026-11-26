@@ -4,6 +4,12 @@ emission_factor_kg_per_kwh: null # TODO: xác minh hệ số phát thải phù h
 cdd_base_temp_c: 24 # GIẢ ĐỊNH - cần kiểm chứng
 seu_threshold: 0.8 # GIẢ ĐỊNH - cần kiểm chứng
 
+# Điền tọa độ để theo dõi địa điểm này khi mở Dashboard.
+weather:
+  location_name: ""
+  latitude: null
+  longitude: null
+
 opportunities:
   - name: Tối ưu hệ thống chiller # GIẢ ĐỊNH - cần kiểm chứng
     applies_to: kwh_chiller # GIẢ ĐỊNH - cần kiểm chứng

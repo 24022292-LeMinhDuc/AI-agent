@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
 import plotly.subplots
+import pytest
 from streamlit.testing.v1 import AppTest
 
 import db
@@ -13,8 +15,9 @@ import mapping
 import tools
 
 
+@pytest.mark.parametrize("has_total_meter", [True, False])
 def test_analysis_and_mapping_are_reused_across_app_reruns(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, has_total_meter: bool,
 ) -> None:
     """Một file và cùng lựa chọn giao diện chỉ chạy tính toán một lần."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
@@ -47,8 +50,12 @@ def test_analysis_and_mapping_are_reused_across_app_reruns(
             monkeypatch.setattr(module, name, counted)
 
     sample = Path(__file__).parents[1] / "data" / "sample_a.csv"
+    content = sample.read_bytes()
+    if not has_total_meter:
+        readings = pd.read_csv(sample).drop(columns="Tong_dien_tieu_thu_kWh")
+        content = readings.to_csv(index=False).encode("utf-8")
     app = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run()
-    app.file_uploader[0].set_value((sample.name, sample.read_bytes(), "text/csv"))
+    app.file_uploader[0].set_value((sample.name, content, "text/csv"))
     app.run()
     fingerprint = app.session_state["store"]["upload_fingerprint"]
     app.button(key=f"confirm_{fingerprint}").click()
@@ -87,7 +94,7 @@ def test_analysis_and_mapping_are_reused_across_app_reruns(
         "detect_unit_issues": 1,
         "aggregate_consumption": 1,
         "seu_pareto": 1,
-        "total_kwh": 1,
+        "total_kwh": int(not has_total_meter),
         "enpi_regression": 1,
         "make_subplots": 2,
     }

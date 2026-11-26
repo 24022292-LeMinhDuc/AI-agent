@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from energy_baseline import BASELINE_DRIVERS
+
 _DATE_PATTERN = r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
 _METER_PATTERN = r"^kwh_[A-Za-z0-9_]+$"
 _DRIVERS_SCHEMA = {
@@ -60,7 +62,11 @@ SCHEMAS: dict[str, dict[str, object]] = {
             "reporting_start": {"type": "string", "pattern": _DATE_PATTERN},
             "reporting_end": {"type": "string", "pattern": _DATE_PATTERN},
             "energy_col": {"type": "string", "pattern": _METER_PATTERN},
-            "drivers": _DRIVERS_SCHEMA,
+            "drivers": {
+                **_DRIVERS_SCHEMA,
+                "items": {"type": "string", "enum": list(BASELINE_DRIVERS)},
+                "maxItems": len(BASELINE_DRIVERS),
+            },
         },
         "required": [
             "baseline_start", "baseline_end", "reporting_start", "reporting_end", "energy_col", "drivers"
@@ -115,6 +121,7 @@ TOOLS: list[dict[str, object]] = [
         "description": (
             "Lập đường cơ sở điện theo ngày và so sánh điện đo kỳ báo cáo với dự đoán đã chuẩn hóa. "
             "Cần ngày bắt đầu/kết thúc hai kỳ, phạm vi cột điện (kwh_total cho tổng) và biến đã chọn. "
+            "Biến điều chỉnh gồm sản lượng, CDD, giờ vận hành, độ ẩm, diện tích hoặc mức lấp đầy có đơn vị. "
             "Chỉ dùng các kỳ đã được người dùng xác định. Chênh lệch là ước tính từ mô hình."
         ),
         "input_schema": SCHEMAS["energy_baseline"],

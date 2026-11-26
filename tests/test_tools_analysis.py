@@ -312,3 +312,117 @@ def test_opportunity_uses_only_dated_readings_and_preserves_unavailable_estimate
     assert unavailable["saved_kwh"] is None
     assert unavailable["co2_tonnes"] is None
     assert unavailable["roi_pct"] is None
+
+
+def test_authoritative_total_preserves_missing_and_excludes_submeter_double_count() -> None:
+    """Công tơ tổng giữ ranh giới kể cả khi có khoảng thiếu và các phụ tải đầy đủ."""
+    df = pd.DataFrame({
+        "timestamp": ["2025-01-01", "2025-01-02", "2025-01-03", "2025-02-01"],
+        "kwh_total": [250, None, 200, 500],
+        "kwh_chiller": [100, 130, None, 140],
+        "kwh_other": [60, 80, 70, 90],
+        "production_t": [10, 50, 15, 20],
+    })
+    cols = ["kwh_total", "kwh_chiller", "kwh_other"]
+
+    cleaned, quality = clean(df, cols)
+    assert pd.isna(cleaned.loc[1, "kwh_total"])
+    assert quality["kwh_total"] == {"removed": 0, "interpolated": 0, "missing": 1}
+    assert total_kwh(df, cols, require_complete=True).dropna().tolist() == [250, 200, 500]
+
+    monthly = aggregate_consumption(df, "month", cols)
+    assert monthly.columns.tolist().count("kwh_total") == 1
+    assert monthly["kwh_total"].tolist() == [450, 500]
+    assert monthly["kwh_other"].tolist() == [210, 90]
+
+    dataset = dataset_summary(df, cols)
+    assert dataset["total_source"] == "metered_total"
+    assert dataset["total_kwh"] == 950
+    assert dataset["total_energy_rows"] == 3
+    assert dataset["energy_reconciliation"] == {
+        "paired_rows": 2, "metered_total_kwh": 750, "submeter_kwh": 390, "residual_kwh": 360,
+    }
+
+    dashboard = dashboard_analysis(df, "day", cols, "2025-01-01", "2025-01-31", 3)["summary"]
+    assert dashboard["total_kwh"] == 450
+    assert dashboard["intensity_rows"] == 2
+    assert dashboard["kwh_per_ton"] == 18
+    assert dashboard["estimated_cost_vnd"] == 1350
+    assert dashboard["total_energy_rows"] == 2
+    assert dashboard["energy_reconciliation"]["paired_rows"] == 1
+
+    comparison = compare_periods(df, "2025-01", "2025-02", cols)
+    assert comparison["total_kwh_difference"] == 50
+    assert comparison["kwh_differences"]["kwh_total"] == 50
+    assert comparison["main_driver"] is None
+
+    pareto = seu_pareto(df, cols, 0.8)
+    assert pareto.index.tolist() == ["kwh_chiller", "kwh_other"]
+    assert np.isclose(pareto["share"].sum(), 1)
+    assert seu_pareto(df, ["kwh_total"], 0.8).empty
+
+
+def test_building_audit_uses_paired_cooling_and_keeps_reported_carbon_separate() -> None:
+    """Tổng hợp số đã ghi và tính chiller/EUI theo các dòng ghép hợp lệ."""
+    df = pd.DataFrame({
+        "timestamp": ["2025-01-01", "2025-01-02", "2025-01-03", "invalid"],
+        "facility_type": ["Toa_nha"] * 4,
+        "floor_area_m2": [100, 100, 100, 500],
+        "production_t": [2, 2, 2, 2],
+        "kwh_total": [400, None, 800, 9999],
+        "kwh_chiller": [40, 20, 0, 999],
+        "cooling_load_rth": [80, 20, 600, 999],
+        "energy_cost_vnd": [1000, None, 2000, 4000],
+        "peak_demand_kw": [110, 180, 150, 500],
+        "power_factor": [0.9, 0.8, 2, 0.1],
+        "boiler_fuel_kg": [2, 5, 4, 999],
+        "fuel_type": ["LPG", "DO", "LPG", "LPG"],
+        "scope1_tco2e": [0.2, None, 0, 99],
+        "scope2_tco2e": [None, None, None, 99],
+        "total_emissions_tco2e": [1.1, 1.2, 1.3, 99],
+    })
+
+    result = dashboard_analysis(df, "day", ["kwh_total", "kwh_chiller"], "2025-01-01", "2025-01-03", None)
+    assert result["summary"]["kwh_per_ton"] is None
+    audit = result["summary"]["reported_audit"]
+    assert audit["valid_timestamp_rows"] == 3
+    assert audit["energy_cost_vnd"] == {"value": 3000, "rows": 2}
+    assert audit["peak_demand_kw"] == {"value": 180, "rows": 3}
+    assert np.isclose(audit["power_factor_mean"]["value"], 0.85)
+    assert audit["scope1_tco2e"] == {"value": 0.2, "rows": 2}
+    assert audit["scope2_tco2e"] == {"value": None, "rows": 0}
+    assert np.isclose(audit["total_emissions_tco2e"]["value"], 3.6)
+    assert audit["boiler_fuel_kg_by_type"] == {
+        "LPG": {"value": 6, "rows": 2}, "DO": {"value": 5, "rows": 1},
+    }
+    assert audit["building_eui"] == {"floor_area_m2": 100, "paired_rows": 2, "kwh": 1200, "kwh_per_m2": 12}
+    assert audit["chiller"]["paired_rows"] == 2
+    assert audit["chiller"]["electricity_kwh"] == 60
+    assert audit["chiller"]["cooling_load_rth"] == 100
+    assert np.isclose(audit["chiller"]["kw_per_rt"], 0.6)
+    assert np.isclose(audit["chiller"]["cop"], 3.51685284 / 0.6)
+
+
+def test_audit_uses_source_rows_instead_of_interpolated_submeters() -> None:
+    """Hiệu suất chiller và đối chiếu điện dùng số gốc, cùng phạm vi ngày đã lọc."""
+    measured = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01", periods=4),
+        "kwh_total": [200, 300, 400, 1900],
+        "kwh_chiller": [20, None, 60, 90],
+        "cooling_load_rth": [30, 40, 50, 160],
+    })
+    columns = ["kwh_total", "kwh_chiller"]
+    cleaned, _ = clean(measured, columns)
+    assert cleaned.loc[1, "kwh_chiller"] == 40
+
+    dashboard = dashboard_analysis(
+        cleaned, "day", columns, "2025-01-01", "2025-01-03", None, audit_df=measured,
+    )["summary"]
+    assert dashboard["energy_kwh_by_column"]["kwh_chiller"] == 120
+    assert dashboard["energy_reconciliation"]["submeter_kwh"] == 80
+    assert dashboard["reported_audit"]["chiller"]["paired_rows"] == 2
+    assert dashboard["reported_audit"]["chiller"]["electricity_kwh"] == 80
+
+    dataset = dataset_summary(cleaned, columns, audit_df=measured)
+    assert dataset["reported_audit"]["chiller"]["paired_rows"] == 3
+    assert dataset["energy_reconciliation"]["submeter_kwh"] == 170

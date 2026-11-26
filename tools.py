@@ -10,6 +10,25 @@ import pandas as pd
 
 
 REPORTING_TIMEZONE = "Asia/Ho_Chi_Minh"
+TOTAL_METER = "kwh_total"
+KW_PER_REFRIGERATION_TON = 3.51685284
+_AUDIT_METRICS = {
+    "energy_cost_vnd": ("energy_cost_vnd", "sum"),
+    "peak_demand_kw": ("peak_demand_kw", "max"),
+    "power_factor_mean": ("power_factor", "mean"),
+    "scope1_tco2e": ("scope1_tco2e", "sum"),
+    "scope2_tco2e": ("scope2_tco2e", "sum"),
+    "total_emissions_tco2e": ("total_emissions_tco2e", "sum"),
+    "steam_t": ("steam_t", "sum"),
+    "operating_hours": ("operating_hours", "sum"),
+}
+_CONTEXT_COLUMNS = {"facility_type", "tariff_period", "operating_status", "fuel_type", "occupancy_unit"}
+_MEASUREMENT_COLUMNS = {
+    "production_t", "temp_c", "cdd", "floor_area_m2", "occupancy_value", "occupancy_people",
+    "occupancy_pct", "outdoor_humidity_pct", "boiler_fuel_kg", "cooling_load_rth",
+    "sec_eui_kwh_per_unit", "baseline_kwh_per_unit", "grid_emission_factor_kgco2e_per_kwh",
+    *(source for source, _ in _AUDIT_METRICS.values()),
+}
 
 
 def reporting_timestamps(values: pd.Series) -> pd.Series:
@@ -57,10 +76,13 @@ def resolve_measurement_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     positions = timestamps.index[repeated]
     measurement_cols = [
         column for column in df.columns
-        if str(column).startswith("kwh_") or column in {"production_t", "temp_c", "cdd"}
+        if str(column).startswith("kwh_") or column in _MEASUREMENT_COLUMNS
     ]
-    measurements = df.iloc[positions].loc[:, measurement_cols].apply(finite_readings)
+    repeated_rows = df.iloc[positions]
+    measurements = repeated_rows.loc[:, measurement_cols].apply(finite_readings)
     measurements = measurements.set_axis(positions)
+    for column in _CONTEXT_COLUMNS.intersection(df.columns):
+        measurements[column] = repeated_rows[column].astype("string").str.strip().to_numpy()
     measurements["timestamp"] = timestamps.loc[positions]
     redundant = measurements.duplicated()
     distinct_timestamps = measurements.loc[~redundant, "timestamp"]
@@ -79,10 +101,166 @@ def resolve_measurement_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
 
 def _energy_readings(df: pd.DataFrame, kwh_cols: Sequence[str]) -> pd.DataFrame:
     """Lấy số đo năng lượng hữu hạn, có thời gian hợp lệ nếu đã ánh xạ."""
-    energy = df.loc[:, list(kwh_cols)].apply(finite_readings)
+    energy = df.loc[:, list(dict.fromkeys(kwh_cols))].apply(finite_readings)
+    energy = energy.where(energy.ge(0))
     if "timestamp" in df.columns:
         energy = energy.where(reporting_timestamps(df["timestamp"]).notna(), axis=0)
     return energy
+
+
+def submeter_columns(kwh_cols: Sequence[str]) -> list[str]:
+    """Chọn cột phụ tải cho biểu đồ thành phần và Pareto."""
+    return [column for column in dict.fromkeys(kwh_cols) if column != TOTAL_METER]
+
+
+def _total_source(kwh_cols: Sequence[str]) -> str | None:
+    """Xác định phạm vi số điện tổng."""
+    if TOTAL_METER in kwh_cols:
+        return "metered_total"
+    return "submeter_sum" if len(kwh_cols) else None
+
+
+def _row_energy_total(energy: pd.DataFrame, *, require_complete: bool = False) -> pd.Series:
+    """Ưu tiên công tơ tổng cho toàn kỳ, kể cả khi thiếu số đo ở vài dòng."""
+    if TOTAL_METER in energy.columns:
+        return energy[TOTAL_METER]
+    min_count = max(1, len(energy.columns)) if require_complete else 1
+    return energy.sum(axis=1, min_count=min_count).rename(TOTAL_METER)
+
+
+def _optional_number(value: float) -> float | None:
+    return float(value) if pd.notna(value) and isfinite(value) else None
+
+
+def _factory_rows(df: pd.DataFrame) -> pd.Series:
+    """Dùng suất tiêu hao theo tấn cho phạm vi có sản xuất."""
+    if "facility_type" not in df:
+        return pd.Series(True, index=df.index)
+    return df["facility_type"].eq("Nha_may").fillna(False)
+
+
+def _energy_reconciliation(energy: pd.DataFrame) -> dict[str, float | int | None] | None:
+    """Đối chiếu điện tổng và tổng phụ tải trên cùng các khoảng đủ số đo."""
+    submeter_cols = submeter_columns(list(energy.columns))
+    if TOTAL_METER not in energy or not submeter_cols:
+        return None
+
+    paired = energy.dropna()
+    total = paired[TOTAL_METER].sum(min_count=1)
+    subtotal = paired[submeter_cols].sum().sum() if len(paired) else float("nan")
+    return {
+        "paired_rows": len(paired),
+        "metered_total_kwh": _optional_number(total),
+        "submeter_kwh": _optional_number(subtotal),
+        "residual_kwh": _optional_number(total - subtotal),
+    }
+
+
+def _building_eui(df: pd.DataFrame, energy: pd.DataFrame) -> dict[str, float | int] | None:
+    """Tính kWh/m² trong kỳ cho tòa nhà diện tích cố định."""
+    if not {"facility_type", "floor_area_m2"}.issubset(df.columns):
+        return None
+    if not df["facility_type"].eq("Toa_nha").fillna(False).all():
+        return None
+    floor_area = finite_readings(df["floor_area_m2"])
+    positive_area = floor_area.gt(0)
+    areas = floor_area.loc[positive_area].unique()
+    totals = _row_energy_total(energy, require_complete=True)
+    paired = positive_area & totals.notna()
+    if len(areas) != 1 or not paired.any():
+        return None
+
+    area = float(areas[0])
+    kilowatt_hours = float(totals.loc[paired].sum())
+    return {
+        "floor_area_m2": area,
+        "paired_rows": int(paired.sum()),
+        "kwh": kilowatt_hours,
+        "kwh_per_m2": kilowatt_hours / area,
+    }
+
+
+def _chiller_performance(df: pd.DataFrame, energy: pd.DataFrame) -> dict[str, float | int] | None:
+    """Tính hiệu suất từ điện và tải lạnh ghi trên cùng khoảng chạy."""
+    if "kwh_chiller" not in energy or "cooling_load_rth" not in df:
+        return None
+    chiller_energy = energy["kwh_chiller"]
+    cooling = finite_readings(df["cooling_load_rth"])
+    paired = chiller_energy.gt(0) & cooling.gt(0)
+    if not paired.any():
+        return None
+
+    kilowatt_hours = float(chiller_energy.loc[paired].sum())
+    ton_hours = float(cooling.loc[paired].sum())
+    return {
+        "paired_rows": int(paired.sum()),
+        "electricity_kwh": kilowatt_hours,
+        "cooling_load_rth": ton_hours,
+        "kw_per_rt": kilowatt_hours / ton_hours,
+        "cop": KW_PER_REFRIGERATION_TON * ton_hours / kilowatt_hours,
+    }
+
+
+def _reported_audit_metrics(df: pd.DataFrame, energy: pd.DataFrame) -> dict[str, object]:
+    """Tổng hợp chỉ số đã ghi trên các dòng có thời gian hợp lệ."""
+    if "timestamp" not in df:
+        return {}
+    result: dict[str, object] = {}
+    for metric, (column, operator) in _AUDIT_METRICS.items():
+        if column not in df:
+            continue
+        readings = finite_readings(df[column])
+        valid = readings.ge(0)
+        if metric == "power_factor_mean":
+            valid &= readings.le(1)
+        readings = readings.loc[valid]
+        result[metric] = {
+            "value": _optional_number(readings.agg(operator)) if len(readings) else None,
+            "rows": len(readings),
+        }
+    if "boiler_fuel_kg" in df:
+        readings = finite_readings(df["boiler_fuel_kg"])
+        valid = readings.ge(0)
+        labels = (
+            df["fuel_type"].astype("string").str.strip().replace("", pd.NA)
+            if "fuel_type" in df
+            else pd.Series(pd.NA, index=df.index, dtype="string")
+        )
+        groups = readings.loc[valid].groupby(labels.loc[valid].fillna("Chưa ghi loại"))
+        result["boiler_fuel_kg_by_type"] = {
+            str(label): {"value": _optional_number(amount.sum()), "rows": len(amount)}
+            for label, amount in groups
+        }
+    if (eui := _building_eui(df, energy)) is not None:
+        result["building_eui"] = eui
+    if (chiller := _chiller_performance(df, energy)) is not None:
+        result["chiller"] = chiller
+    if result:
+        result["valid_timestamp_rows"] = len(df)
+    return result
+
+
+def _audit_sections(
+    df: pd.DataFrame,
+    energy: pd.DataFrame,
+    audit_df: pd.DataFrame | None,
+    *,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+) -> dict[str, object]:
+    """Đối chiếu và tính chỉ số trên số đo gốc khi được cung cấp."""
+    if audit_df is not None and "timestamp" in audit_df:
+        source, _ = resolve_measurement_rows(audit_df)
+        timestamps = reporting_timestamps(source["timestamp"])
+        valid = timestamps.notna()
+        if start is not None and end is not None:
+            valid &= timestamps.ge(start) & timestamps.lt(end + pd.Timedelta(days=1))
+        df = source.loc[valid]
+        energy = _energy_readings(df, list(energy.columns))
+    return {
+        "energy_reconciliation": _energy_reconciliation(energy),
+        "reported_audit": _reported_audit_metrics(df, energy),
+    }
 
 
 def clean(
@@ -115,20 +293,22 @@ def clean(
             invalid |= values > 3 * percentile_99
 
         values = values.mask(invalid)
-        ordered_values = values.iloc[order]
-        missing_before = ordered_values.isna()
-        runs = ordered_values.notna().cumsum()
-        short_gaps = missing_before & missing_before.groupby(runs).transform("sum").le(3)
-        if segments is not None:
-            anchors = segments.where(~missing_before)
-            short_gaps &= anchors.ffill().eq(anchors.bfill())
-
-        interpolated = ordered_values.interpolate(limit_area="inside").where(short_gaps)
-        values.iloc[order] = ordered_values.fillna(interpolated).to_numpy()
+        interpolated_count = 0
+        if column != TOTAL_METER:
+            ordered_values = values.iloc[order]
+            missing_before = ordered_values.isna()
+            runs = ordered_values.notna().cumsum()
+            short_gaps = missing_before & missing_before.groupby(runs).transform("sum").le(3)
+            if segments is not None:
+                anchors = segments.where(~missing_before)
+                short_gaps &= anchors.ffill().eq(anchors.bfill())
+            interpolated = ordered_values.interpolate(limit_area="inside").where(short_gaps)
+            values.iloc[order] = ordered_values.fillna(interpolated).to_numpy()
+            interpolated_count = int(interpolated.notna().sum())
         clean_df[column] = values.to_numpy()
         report[column] = {
             "removed": int(invalid.sum()),
-            "interpolated": int(interpolated.notna().sum()),
+            "interpolated": interpolated_count,
             "missing": int(values.isna().sum()),
         }
 
@@ -142,7 +322,7 @@ def seu_pareto(
     if not 0 <= threshold <= 1:
         raise ValueError("Ngưỡng SEU phải nằm trong khoảng từ 0 đến 1.")
     df, _ = resolve_measurement_rows(df)
-    totals = _energy_readings(df, kwh_cols).sum(axis=0, min_count=1)
+    totals = _energy_readings(df, submeter_columns(kwh_cols)).sum(axis=0, min_count=1)
     totals = totals.astype(float).sort_values(ascending=False, kind="stable")
     grand_total = float(totals.sum())
 
@@ -161,15 +341,13 @@ def seu_pareto(
 def total_kwh(
     df: pd.DataFrame, kwh_cols: Sequence[str], *, require_complete: bool = False
 ) -> pd.Series:
-    """Tính tổng điện từng dòng từ các cột kWh."""
-    if not kwh_cols:
-        return pd.Series(float("nan"), index=df.index, name="kwh_total")
-    min_count = len(kwh_cols) if require_complete else 1
-    energy = _energy_readings(df, kwh_cols)
-    return energy.sum(axis=1, min_count=min_count).rename("kwh_total")
+    """Lấy số đo tổng hoặc cộng các phụ tải trên từng dòng."""
+    return _row_energy_total(_energy_readings(df, kwh_cols), require_complete=require_complete)
 
 
-def dataset_summary(df: pd.DataFrame, kwh_cols: Sequence[str]) -> dict[str, object]:
+def dataset_summary(
+    df: pd.DataFrame, kwh_cols: Sequence[str], *, audit_df: pd.DataFrame | None = None,
+) -> dict[str, object]:
     """Tóm tắt metadata và các chỉ số có sẵn trong dataset."""
     intervals, quality = resolve_measurement_rows(df)
     valid_timestamps = pd.Series(dtype="datetime64[ns]")
@@ -180,7 +358,7 @@ def dataset_summary(df: pd.DataFrame, kwh_cols: Sequence[str]) -> dict[str, obje
         observed = intervals.loc[timestamps.notna()]
     energy = _energy_readings(observed, kwh_cols)
     energy_totals = energy.sum(min_count=1)
-    total_energy = energy_totals.sum(min_count=1)
+    row_total = _row_energy_total(energy)
     production = (
         finite_readings(observed["production_t"]).sum(min_count=1)
         if "production_t" in observed.columns
@@ -207,7 +385,10 @@ def dataset_summary(df: pd.DataFrame, kwh_cols: Sequence[str]) -> dict[str, obje
             str(column): float(value) if pd.notna(value) else None
             for column, value in energy_totals.items()
         },
-        "total_kwh": float(total_energy) if pd.notna(total_energy) else None,
+        "total_kwh": _optional_number(row_total.sum(min_count=1)),
+        "total_source": _total_source(kwh_cols),
+        "total_energy_rows": int(row_total.count()),
+        **_audit_sections(observed, energy, audit_df),
         "production_tons": float(production) if pd.notna(production) else None,
         "average_temp_c": float(temperature) if pd.notna(temperature) else None,
     }
@@ -220,6 +401,8 @@ def dashboard_analysis(
     start_date: str,
     end_date: str,
     tariff_vnd_per_kwh: float | None,
+    *,
+    audit_df: pd.DataFrame | None = None,
 ) -> dict[str, object]:
     """Tổng hợp biểu đồ và KPI cho khoảng ngày đã chọn."""
     start = pd.Timestamp(start_date)
@@ -241,14 +424,11 @@ def dashboard_analysis(
         else pd.Series(float("nan"), index=filtered_df.index)
     )
     production = production_readings.sum(min_count=1)
-    paired_rows = (
-        energy.notna().all(axis=1) & production_readings.ge(0)
-        if kwh_cols
-        else pd.Series(False, index=filtered_df.index)
-    )
+    matched_energy = _row_energy_total(energy, require_complete=True)
+    paired_rows = matched_energy.notna() & production_readings.ge(0) & _factory_rows(filtered_df)
     paired_production = production_readings.loc[paired_rows].sum()
     intensity = (
-        float(energy.loc[paired_rows].sum().sum() / paired_production)
+        float(matched_energy.loc[paired_rows].sum() / paired_production)
         if paired_production > 0
         else None
     )
@@ -269,6 +449,9 @@ def dashboard_analysis(
             "rows": int(len(filtered_df)),
             "interval_quality": quality,
             "total_kwh": total_value,
+            "total_source": _total_source(kwh_cols),
+            "total_energy_rows": int(_row_energy_total(energy).count()),
+            **_audit_sections(filtered_df, energy, audit_df, start=start, end=end),
             "energy_rows_by_column": energy.count().to_dict(),
             "energy_kwh_by_column": {
                 str(column): float(value) if pd.notna(value) else None
@@ -308,16 +491,13 @@ def aggregate_consumption(
     data = data.loc[data["_period"].notna()]
     if data.empty:
         return pd.DataFrame(
-            columns=["timestamp", *kwh_cols, "kwh_total", "temp_c", "production_t"]
+            columns=["timestamp", *submeter_columns(kwh_cols), TOTAL_METER, "temp_c", "production_t"]
         )
 
-    energy = data.loc[:, list(kwh_cols)].apply(finite_readings)
+    energy = _energy_readings(data, kwh_cols)
     result = energy.groupby(data["_period"]).sum(min_count=1)
-    result["kwh_total"] = (
-        result[list(kwh_cols)].sum(axis=1, min_count=1)
-        if kwh_cols
-        else float("nan")
-    )
+    if TOTAL_METER not in result:
+        result[TOTAL_METER] = _row_energy_total(energy).groupby(data["_period"]).sum(min_count=1)
     if "temp_c" in data.columns:
         temperature = finite_readings(data["temp_c"])
         result["temp_c"] = temperature.groupby(data["_period"]).mean()
@@ -343,7 +523,7 @@ def enpi_regression(
     numeric_data = df.reindex(columns=required_columns).apply(finite_readings)
     timestamps = reporting_timestamps(df["timestamp"])
     valid_energy = timestamps.notna() & numeric_data[total_col].ge(0)
-    matched_rows = valid_energy & numeric_data["production_t"].ge(0)
+    matched_rows = valid_energy & numeric_data["production_t"].ge(0) & _factory_rows(df)
     matched = numeric_data.loc[matched_rows, [total_col, "production_t"]]
     production_total = matched["production_t"].sum()
     kwh_per_ton = (
@@ -411,16 +591,18 @@ def compare_periods(
     df, quality = resolve_measurement_rows(df)
     days = reporting_timestamps(df["timestamp"]).dt.normalize()
     months = days.dt.strftime("%Y-%m")
-    meters = list(kwh_cols)
+    meters = list(dict.fromkeys(kwh_cols))
     readings = df.reindex(columns=[*meters, "production_t", "temp_c"]).apply(finite_readings)
     readings[meters] = readings[meters].where(readings[meters].ge(0))
     grouped = readings.groupby(months)
     pair = [month_a, month_b]
     totals = grouped[[*meters, "production_t"]].sum(min_count=1).reindex(pair)
+    total_energy = _row_energy_total(readings[meters]).groupby(months).sum(min_count=1).reindex(pair)
     temperature = grouped["temp_c"].mean().reindex(pair)
     differences = totals.iloc[1] - totals.iloc[0]
     kwh_differences = differences.loc[meters]
-    positive_kwh_changes = kwh_differences[kwh_differences.gt(0)]
+    submeter_changes = kwh_differences.loc[submeter_columns(meters)]
+    positive_kwh_changes = submeter_changes[submeter_changes.gt(0)]
     temperature_difference = temperature.iloc[1] - temperature.iloc[0]
     production_difference = differences["production_t"]
     row_counts = grouped.size().reindex(pair, fill_value=0)
@@ -449,6 +631,8 @@ def compare_periods(
         "rows_month_b": int(row_counts.iloc[1]),
         "coverage": coverage,
         "interval_quality": quality,
+        "total_source": _total_source(kwh_cols),
+        "total_kwh_difference": _optional_number(total_energy.iloc[1] - total_energy.iloc[0]),
         "kwh_differences": {
             str(column): float(value) if pd.notna(value) else None
             for column, value in kwh_differences.items()

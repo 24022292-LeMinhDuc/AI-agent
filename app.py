@@ -22,6 +22,7 @@ from plotly.subplots import make_subplots
 
 import db
 from agent import ask, run_tool
+from energy_baseline import BASELINE_DRIVER_LABELS
 from mapping import (
     CANONICAL_COLUMNS,
     apply_mapping,
@@ -30,12 +31,15 @@ from mapping import (
     validate_mapped_data,
 )
 from report import (
+    audit_summary_rows,
     build_report_data,
     generate_interpretation,
     render_docx,
     render_markdown,
     render_report_json,
 )
+from tools import submeter_columns
+from weather_panel import show_hourly_weather
 
 
 CATEGORY_LABELS = {
@@ -43,12 +47,21 @@ CATEGORY_LABELS = {
     "kwh_chiller": "Điện chiller",
     "kwh_compressed_air": "Điện khí nén",
     "kwh_lighting": "Điện chiếu sáng",
+    "kwh_other": "Điện phụ tải khác",
+    "kwh_total": "Điện tổng từ tệp",
 }
 METER_COLORS = {
     "kwh_production": "#138676",
     "kwh_chiller": "#5590b3",
     "kwh_compressed_air": "#d9944c",
     "kwh_lighting": "#907ab8",
+    "kwh_other": "#6d9291",
+}
+
+SAMPLE_FILES = {
+    "Nhà máy": "sample_a.csv",
+    "Tòa nhà": "sample_b.csv",
+    "Kiểm tra chất lượng dữ liệu": "sample_c.csv",
 }
 
 PAGES = {
@@ -275,7 +288,7 @@ def _build_dashboard_figure(aggregated: pd.DataFrame, kwh_cols: list[str]) -> go
     """Dựng biểu đồ tổng điện, nhiệt độ và sản lượng."""
     panels = [("energy", "Điện năng tiêu thụ")]
     if "temp_c" in aggregated.columns and aggregated["temp_c"].notna().any():
-        panels.append(("temperature", "Nhiệt độ ngoài trời"))
+        panels.append(("temperature", "Nhiệt độ ngoài trời từ tệp"))
     if "production_t" in aggregated.columns and aggregated["production_t"].notna().any():
         panels.append(("production", "Sản lượng"))
     panel_weights = {"energy": 0.55, "temperature": 0.22, "production": 0.23}
@@ -289,7 +302,7 @@ def _build_dashboard_figure(aggregated: pd.DataFrame, kwh_cols: list[str]) -> go
         row_heights=normalized_heights,
         subplot_titles=[title for _, title in panels],
     )
-    for column in kwh_cols:
+    for column in submeter_columns(kwh_cols):
         figure.add_trace(
             go.Bar(
                 x=aggregated["timestamp"],
@@ -533,6 +546,32 @@ def _show_dashboard(store: dict[str, Any]) -> None:
         f"Khoảng {start_date:%Y-%m-%d} đến {end_date:%Y-%m-%d} · "
         f"run_id {dashboard_response['run_id']} · chỉ số tính từ dataset đã xác nhận."
     )
+    if summary.get("total_source") == "metered_total":
+        st.caption("Điện tổng lấy từ cột công tơ tổng. Biểu đồ cột thể hiện các phụ tải.")
+    elif summary.get("total_source") == "submeter_sum":
+        st.caption("Điện tổng là tổng các phụ tải có số đo trong phạm vi đã ánh xạ.")
+    if audit := summary.get("reported_audit"):
+        rows = audit_summary_rows(audit)
+        if rows:
+            with st.expander("Vận hành, nhiệt và phát thải"):
+                st.caption("Chi phí và phát thải được tổng hợp từ cột đã khai báo trong tệp.")
+                st.dataframe(
+                    pd.DataFrame(rows, columns=["Chỉ số", "Giá trị", "Dòng dùng tính"]),
+                    hide_index=True,
+                    width="stretch",
+                )
+    if "anomaly_note" in df:
+        in_period = df["timestamp"].ge(pd.Timestamp(start_date)) & df["timestamp"].lt(
+            pd.Timestamp(end_date) + pd.Timedelta(days=1)
+        )
+        notes = df.loc[in_period & df["anomaly_note"].notna(), ["timestamp", "anomaly_note"]]
+        if not notes.empty:
+            with st.expander("Ghi chú bất thường từ tệp"):
+                st.dataframe(
+                    notes.rename(columns={"timestamp": "Thời điểm", "anomaly_note": "Ghi chú"}),
+                    hide_index=True,
+                    width="stretch",
+                )
     energy_rows = summary.get("energy_rows_by_column", {})
     if energy_rows:
         with st.expander("Độ phủ số đo trong khoảng đã chọn"):
@@ -546,6 +585,11 @@ def _show_dashboard(store: dict[str, Any]) -> None:
             if summary.get("intensity_rows") is not None:
                 st.caption(f"Dòng ghép được điện năng với sản lượng · {summary['intensity_rows']:,}")
             _show_interval_quality(summary.get("interval_quality", {}))
+            if reconciliation := summary.get("energy_reconciliation"):
+                st.caption(
+                    f"Đối chiếu {reconciliation['paired_rows']:,} dòng đủ số liệu. "
+                    f"Điện tổng trừ tổng phụ tải: {_format_value(reconciliation['residual_kwh'])} kWh."
+                )
 
     if aggregated.empty:
         st.info("Không có bản ghi trong khoảng ngày đã chọn.")
@@ -701,7 +745,7 @@ def _show_seu_enpi(store: dict[str, Any]) -> None:
         return
     store.setdefault("analysis_results", {})["seu"] = seu_response
     if pareto.empty:
-        st.info("Không có dữ liệu để tính Pareto.")
+        st.info("Cần số đo theo phụ tải để phân tích Pareto SEU.")
     else:
         figure = _session_cached(
             store,
@@ -728,7 +772,8 @@ def _show_seu_enpi(store: dict[str, Any]) -> None:
 
     st.subheader("EnPI")
     driver_labels = {"production_t": "Sản lượng", "cdd": "CDD"}
-    available_drivers = tuple(driver for driver in driver_labels if driver in df.columns)
+    present_drivers = tuple(driver for driver in driver_labels if driver in df)
+    available_drivers = tuple(driver for driver in present_drivers if df[driver].nunique() > 1) or present_drivers
     if not available_drivers:
         st.info("Ánh xạ sản lượng hoặc nhiệt độ để chọn biến hồi quy EnPI.")
         return
@@ -919,7 +964,7 @@ def _show_baseline_result(store: dict[str, Any], response: dict[str, Any]) -> No
             "Chỉ số độ phù hợp tính trong kỳ cơ sở. NMBE gần 0 với mô hình có hệ số chặn "
             "phản ánh độ lệch trung bình trong mẫu."
         )
-        labels = {"intercept": "Hệ số chặn", "production_t": "Sản lượng", "cdd": "CDD"}
+        labels = {"intercept": "Hệ số chặn", **BASELINE_DRIVER_LABELS}
         ranges = model["driver_ranges"]
         st.dataframe(
             pd.DataFrame(
@@ -951,10 +996,12 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
 
     with st.expander("Đường cơ sở năng lượng (EnB) và tiết kiệm ước tính"):
         df = store.get("measured_df", store["df"])
-        driver_labels = {"production_t": "Sản lượng", "cdd": "CDD"}
-        drivers = tuple(driver for driver in driver_labels if driver in df.columns)
+        drivers = [
+            driver for driver in BASELINE_DRIVER_LABELS
+            if driver in df and df[driver].nunique() > 1
+        ]
         if not drivers:
-            st.info("Ánh xạ sản lượng hoặc nhiệt độ để xây dựng đường cơ sở có biến điều chỉnh.")
+            st.info("Cần biến điều chỉnh có thay đổi theo ngày, chẳng hạn sản lượng, CDD hoặc giờ vận hành.")
             return
         first = df["timestamp"].min().date()
         last = df["timestamp"].max().date()
@@ -968,9 +1015,9 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
         )
         scope = store["run_scope_id"]
         filters = store.setdefault("baseline_filters", {})
-        mapped_meters = [column for column in df if column.startswith("kwh_")]
+        mapped_meters = submeter_columns([column for column in df if column.startswith("kwh_")])
         meter_labels = {
-            "kwh_total": "Tổng các công tơ đã ánh xạ",
+            "kwh_total": "Công tơ tổng" if "kwh_total" in df else "Tổng các phụ tải đã ánh xạ",
             **{meter: CATEGORY_LABELS.get(meter, meter) for meter in mapped_meters},
         }
         boundary_column, driver_column = st.columns(2)
@@ -982,23 +1029,20 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
                 format_func=meter_labels.__getitem__,
                 key=f"baseline_energy_col_{scope}",
             )
-        driver_options = [drivers]
-        if len(drivers) > 1:
-            driver_options.extend((driver,) for driver in drivers)
+        preferred = [driver for driver in ("production_t", "cdd") if driver in drivers]
         with driver_column:
-            selection = st.selectbox(
+            selection = st.multiselect(
                 "Biến điều chỉnh đường cơ sở",
-                driver_options,
-                index=driver_options.index(filters.get("drivers", drivers)),
-                format_func=lambda values: " + ".join(driver_labels[driver] for driver in values),
+                drivers,
+                default=filters.get("drivers", preferred or drivers[:1]),
+                format_func=BASELINE_DRIVER_LABELS.__getitem__,
                 key=f"baseline_drivers_{scope}",
-                disabled=len(driver_options) == 1,
             )
         if energy_col == "kwh_total":
-            st.caption(
-                "Mỗi ngày dùng tính tổng cần đủ số đo của các công tơ đã ánh xạ. "
-                "Chọn một công tơ nếu cần đánh giá riêng hạng mục đó."
-            )
+            if "kwh_total" in df:
+                st.caption("Đường cơ sở dùng số đo công tơ tổng tại các ngày đủ biến đã chọn.")
+            else:
+                st.caption("Mỗi ngày dùng tính tổng cần đủ số đo các phụ tải đã ánh xạ.")
 
         reporting_days = max(1, (last - first).days // 3)
         report_start = last - timedelta(days=reporting_days - 1)
@@ -1044,6 +1088,10 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
             return
         if baseline[1] >= reporting[0]:
             st.warning("Kỳ cơ sở phải kết thúc trước ngày bắt đầu kỳ báo cáo.")
+            return
+
+        if not selection:
+            st.info("Chọn ít nhất một biến điều chỉnh đường cơ sở.")
             return
 
         if st.button("Tính đường cơ sở", key=f"calculate_baseline_{scope}", type="primary"):
@@ -1339,9 +1387,10 @@ def _show_data_page(store: dict[str, Any]) -> None:
         if sample_column is not None and not store.get("upload_fingerprint"):
             with sample_column:
                 st.markdown("**Dữ liệu mẫu**")
-                st.caption("365 ngày giả lập, gồm sản lượng, nhiệt độ và điện năng của bốn hạng mục.")
+                sample_name = st.selectbox("Loại dữ liệu mẫu", tuple(SAMPLE_FILES), key="sample_variant")
+                st.caption("Số liệu giả lập theo ngày về vận hành, điện, nhiệt, chi phí và phát thải.")
                 if st.button("Dùng dữ liệu mẫu", key="load_sample_dataset", icon=":material/science:"):
-                    path = Path(__file__).with_name("data") / "sample_a.csv"
+                    path = Path(__file__).with_name("data") / SAMPLE_FILES[sample_name]
                     try:
                         _register_source(path.name, path.read_bytes(), store)
                     except OSError as exc:
@@ -1533,6 +1582,14 @@ def _show_data_page(store: dict[str, Any]) -> None:
             st.info("Không có cột điện cần kiểm tra chất lượng.")
 
         if store.get("mapping_confirmed") and isinstance(store.get("df"), pd.DataFrame):
+            mapping_issues = store.get("measured_df", store["df"]).attrs.get("mapping_issues", {})
+            if mapping_issues:
+                st.warning("Có giá trị cần kiểm tra sau ánh xạ. Xem số lượng theo cột ở bảng bên dưới.")
+                st.dataframe(
+                    pd.DataFrame(mapping_issues.items(), columns=["Cột chuẩn", "Số giá trị"]),
+                    hide_index=True,
+                    width="stretch",
+                )
             with st.expander("Xem trước dữ liệu sau chuẩn hóa"):
                 normalized_df = store["df"]
                 st.caption(
@@ -1648,6 +1705,7 @@ def main() -> None:
             _show_data_page(store)
         elif current_page == "Dashboard":
             _page_heading("Dashboard năng lượng", "Theo dõi điện năng, nhiệt độ và sản lượng trong kỳ đã chọn.")
+            show_hourly_weather(store["config"].get("weather"))
             _show_dashboard(store)
         elif current_page == "SEU & EnPI":
             _page_heading("Hiệu suất năng lượng", "Xác định hạng mục tiêu thụ đáng kể, theo dõi EnPI và lập đường cơ sở.")

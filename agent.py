@@ -51,6 +51,7 @@ def run_tool(name: str, args: dict[str, Any], store: dict[str, Any]) -> dict[str
     try:
         source_df = store.get("measured_df", store.get("df", store.get("data")))
         analysis_df = store.get("clean_df", store.get("df", source_df))
+        audit_df = source_df if isinstance(source_df, pd.DataFrame) else None
         config = store.get("config", {})
 
         if name in {"dataset_summary", "dashboard_data", "energy_baseline"} and not store.get("mapping_confirmed"):
@@ -59,7 +60,7 @@ def run_tool(name: str, args: dict[str, Any], store: dict[str, Any]) -> dict[str
             if not isinstance(analysis_df, pd.DataFrame):
                 raise ValueError("store cần có DataFrame đã nạp.")
             kwh_cols = [column for column in analysis_df.columns if str(column).startswith("kwh_")]
-            result = energy_tools.dataset_summary(analysis_df, kwh_cols)
+            result = energy_tools.dataset_summary(analysis_df, kwh_cols, audit_df=audit_df)
         elif name == "dashboard_data":
             if not isinstance(analysis_df, pd.DataFrame):
                 raise ValueError("store cần có DataFrame đã nạp.")
@@ -71,6 +72,7 @@ def run_tool(name: str, args: dict[str, Any], store: dict[str, Any]) -> dict[str
                 args["start_date"],
                 args["end_date"],
                 config.get("tariff_vnd_per_kwh"),
+                audit_df=audit_df,
             )
         elif name == "data_quality":
             if not isinstance(source_df, pd.DataFrame):

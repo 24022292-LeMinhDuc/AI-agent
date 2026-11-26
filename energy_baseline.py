@@ -13,7 +13,16 @@ import pandas as pd
 from tools import finite_readings, reporting_timestamps, resolve_measurement_rows
 
 
-BASELINE_DRIVERS = ("production_t", "cdd")
+BASELINE_DRIVER_LABELS = {
+    "production_t": "Sản lượng (tấn)",
+    "cdd": "CDD",
+    "operating_hours": "Giờ vận hành",
+    "outdoor_humidity_pct": "Độ ẩm ngoài trời (%)",
+    "floor_area_m2": "Diện tích sàn (m²)",
+    "occupancy_people": "Số người",
+    "occupancy_pct": "Tỷ lệ lấp đầy (%)",
+}
+BASELINE_DRIVERS = tuple(BASELINE_DRIVER_LABELS)
 
 
 def _period_dates(start: str, end: str) -> tuple[date, date]:
@@ -50,6 +59,11 @@ def _daily_samples(
     observations, interval_quality = resolve_measurement_rows(sample)
     values = observations.loc[:, [*meters, *drivers]].apply(finite_readings)
     complete = values.ge(0).all(axis=1)
+    for driver, upper_bound in (("operating_hours", 24), ("outdoor_humidity_pct", 100), ("occupancy_pct", 100)):
+        if driver in drivers:
+            complete &= values[driver].le(upper_bound)
+    if "floor_area_m2" in drivers:
+        complete &= values["floor_area_m2"].gt(0)
     totals = values.loc[:, meters].sum(axis=1, min_count=len(meters))
     complete &= np.isfinite(totals)
     matched = values.loc[complete, drivers].copy()
@@ -176,7 +190,7 @@ def normalized_baseline(
     if not meter_cols or len(set(meter_cols)) != len(meter_cols):
         raise ValueError("Chọn ít nhất một cột điện năng, mỗi cột xuất hiện một lần.")
     if not driver_cols or len(set(driver_cols)) != len(driver_cols) or not set(driver_cols).issubset(BASELINE_DRIVERS):
-        raise ValueError("Chọn sản lượng, CDD hoặc cả hai làm biến của đường cơ sở.")
+        raise ValueError("Chọn ít nhất một biến điều chỉnh EnB được hỗ trợ, mỗi biến xuất hiện một lần.")
     if df.columns.has_duplicates:
         raise ValueError("Tên cột phải duy nhất để xác định số đo của từng hạng mục.")
     missing_columns = {"timestamp", *meter_cols, *driver_cols}.difference(df.columns)
