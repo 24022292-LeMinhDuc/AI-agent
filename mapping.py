@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import unicodedata
 from collections.abc import Mapping, Sequence
 from math import isfinite
 from pathlib import Path
@@ -16,7 +15,7 @@ import yaml
 from google.genai import types
 
 from gemini_service import create_client, generate_content
-from tools import finite_readings, reporting_timestamps
+from tools import finite_readings, normalize_label as _normalize_text, reporting_timestamps
 
 
 _SCHEMA_HEADERS = {
@@ -69,14 +68,6 @@ _BOUNDED_FIELDS = {
 }
 
 
-def _normalize_text(value: object) -> str:
-    """Chuẩn hóa chữ thường và bỏ dấu tiếng Việt."""
-    text = str(value).lower().replace("đ", "d").replace("Đ", "d")
-    decomposed = unicodedata.normalize("NFD", text)
-    without_marks = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
-    return re.sub(r"[^a-z0-9]+", " ", without_marks).strip()
-
-
 def _unit_words(normalized_name: str) -> set[str]:
     """Nhận diện cách ghi như kWh, kW h và kW-hour."""
     normalized_name = re.sub(r"\b([kmg]?w)\s+(?:h|hours?)\b", r"\1h", normalized_name)
@@ -100,6 +91,10 @@ _CATEGORY_LOOKUP = {
     column: {_normalize_text(value): value for value in values}
     for column, values in _CATEGORIES.items()
 }
+_CATEGORY_LOOKUP["tariff_period"].update({"peak": "Cao_diem", "normal": "Binh_thuong", "off peak": "Thap_diem"})
+_CATEGORY_LOOKUP["fuel_type"].update({
+    "coal": "Than_da", "do oil": "DO", "fo oil": "FO", "cng": "Khi_tu_nhien",
+})
 _CATEGORY_LOOKUP["occupancy_unit"].update({
     "people": "Nguoi", "persons": "Nguoi",
     "percent": "Pct", "phan tram": "Pct",
@@ -281,10 +276,12 @@ def validate_mapped_data(df: pd.DataFrame) -> list[str]:
             errors.append("Không tìm thấy giá trị thời gian hợp lệ trong timestamp.")
 
     kwh_columns = [column for column in df.columns if str(column).startswith("kwh_")]
-    if not kwh_columns:
-        errors.append("Cần ánh xạ ít nhất một cột điện sang tên bắt đầu bằng kwh_.")
-    elif not any((valid_dates & finite_readings(df[column]).ge(0)).any() for column in kwh_columns):
-        errors.append("Cần ít nhất một số đo điện không âm đi kèm giá trị thời gian hợp lệ.")
+    audit_columns = {"boiler_fuel_kg", "steam_t", "cooling_load_rth", "peak_demand_kw", "power_factor", "energy_cost_vnd"}
+    measurements = [*kwh_columns, *audit_columns.intersection(df.columns)]
+    if not measurements:
+        errors.append("Cần ánh xạ ít nhất một cột điện kWh, nhiên liệu, hơi, tải lạnh, công suất, cos φ hoặc chi phí.")
+    elif not any((valid_dates & finite_readings(df[column]).ge(0)).any() for column in measurements):
+        errors.append("Cần ít nhất một số đo năng lượng hoặc vận hành hợp lệ đi kèm thời gian.")
     if df.empty:
         errors.insert(0, "File không có dòng dữ liệu sau khi áp dụng mapping.")
     return errors

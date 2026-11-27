@@ -76,6 +76,13 @@ def build_report_data(store: dict[str, Any]) -> dict[str, Any]:
     baseline_args = store.get("baseline_args")
     if baseline_args and analysis_results.get("energy_baseline"):
         specs["energy_baseline"] = ("energy_baseline", baseline_args)
+    for optional_tool in ("energy_balance", "tariff_power_quality"):
+        if cached := analysis_results.get(optional_tool):
+            cached_args = cached.get("args") if isinstance(cached, dict) else None
+            specs[optional_tool] = (
+                optional_tool,
+                cached_args if isinstance(cached_args, dict) else {},
+            )
     previous_ids = {key: (analysis_results.get(key) or {}).get("run_id") for key in specs}
     previous_ids["quality"] = previous_ids["quality"] or store.get("quality_run_id")
     previous_ids["opportunities"] = previous_ids["opportunities"] or (
@@ -198,6 +205,13 @@ def build_report_data(store: dict[str, Any]) -> dict[str, Any]:
             "args": baseline_run["args"],
             "result": baseline_run["result"],
         }
+    for optional_tool in ("energy_balance", "tariff_power_quality"):
+        if optional_run := runs.get(optional_tool):
+            report_data[optional_tool] = {
+                "run_id": optional_run["run_id"],
+                "args": optional_run["args"],
+                "result": optional_run["result"],
+            }
     return db._json_safe(report_data)
 
 
@@ -307,7 +321,11 @@ def _baseline_report_blocks(baseline_run: dict[str, Any]) -> list[_ReportBlock]:
         return blocks
 
     scope = ", ".join(result.get("meter_columns", [args["energy_col"]]))
-    drivers = ", ".join(BASELINE_DRIVER_LABELS[driver] for driver in args["drivers"])
+    model = result["model"]
+    drivers = ", ".join(
+        "Nhiệt độ ngoài trời" if driver == "temp_c" else BASELINE_DRIVER_LABELS.get(driver, driver)
+        for driver in model.get("drivers", args["drivers"])
+    )
     blocks.append(f"Cột điện đo · {scope}. Biến hồi quy · {drivers}.")
     coverage_rows = [
         [
@@ -321,7 +339,6 @@ def _baseline_report_blocks(baseline_run: dict[str, Any]) -> list[_ReportBlock]:
     blocks.append(_Table(
         ["Kỳ", "Bắt đầu", "Kết thúc", "Số ngày", "Ngày dùng", "Độ phủ (%)"], coverage_rows
     ))
-    model = result["model"]
     summary = result["summary"]
     blocks.append(_Table(
         ["Chỉ số", "Giá trị"],
@@ -336,8 +353,124 @@ def _baseline_report_blocks(baseline_run: dict[str, Any]) -> list[_ReportBlock]:
             ["NMBE (%)", _format_number(model["nmbe_pct"])],
         ],
     ))
+    if check := result.get("ashrae14_check"):
+        uncertainty = result["uncertainty"]
+        status = "Đạt" if check["passed"] else "Không đạt"
+        granularity = "Ngày" if check["granularity"] == "daily" else "Tháng"
+        blocks.append(_Table(
+            ["Đánh giá M&V", "Giá trị"],
+            [
+                ["Mô hình đã chọn", model["method"]],
+                ["Ngưỡng ASHRAE 14 của dự án", f"{status} · {granularity}"],
+                ["CV(RMSE) dùng kiểm tra (%)", _format_number(check["cvrmse_pct"])],
+                ["NMBE dùng kiểm tra (%)", _format_number(check["nmbe_pct"])],
+                ["Điều chỉnh phi thường lệ (kWh)", _format_number(result["nra_total_kwh"])],
+                ["FSU theo ngày ở 90% (%)", _format_number(uncertainty["fsu_90_pct"])],
+                ["FSU theo ngày ở 95% (%)", _format_number(uncertainty["fsu_95_pct"])],
+            ],
+        ))
+        if adjustments := result.get("non_routine_adjustments"):
+            blocks.append(_Table(
+                ["Từ ngày", "Đến ngày", "kWh/ngày", "Ngày áp dụng", "Lý do"],
+                [
+                    [entry["start_date"], entry["end_date"], _format_number(entry["delta_kwh_per_day"]),
+                     str(entry["applied_days"]), entry["reason"]]
+                    for entry in adjustments
+                ],
+            ))
     blocks.extend(result.get("assumptions", []))
     blocks.extend(result.get("warnings", []))
+    return blocks
+
+
+def _energy_balance_report_blocks(balance_run: dict[str, Any]) -> list[_ReportBlock]:
+    """Tạo các khối tóm tắt cân bằng năng lượng GJ/TOE và hiệu suất thiết bị."""
+    result = balance_run.get("result", {})
+    blocks: list[_ReportBlock] = [f"Lần tính cân bằng năng lượng {balance_run.get('run_id', '—')}"]
+    if not result.get("available"):
+        blocks.append(result.get("reason") or "Chưa đủ dữ liệu cân bằng năng lượng.")
+        return blocks
+
+    summary = [
+        f"Năng lượng đầu vào {_format_number(result.get('total_input_gj'))} GJ "
+        f"({_format_number(result.get('total_input_toe'), 3)} TOE)",
+        f"Hiệu suất lò hơi {_format_number(result.get('boiler_efficiency_pct'))}% "
+        f"({result.get('boiler_paired_rows', 0)} bản ghi ghép cặp)",
+        f"Chiller {_format_number(result.get('chiller_kw_per_rt'), 3)} kW/RT · "
+        f"COP {_format_number(result.get('chiller_cop'))}"
+        + (f" ({result['chiller_rating']})" if result.get("chiller_rating") else ""),
+    ]
+    blocks.append(summary)
+    if rows := result.get("seu_breakdown"):
+        blocks.append(
+            _Table(
+                ["Hạng mục", "GJ", "TOE", "Tỷ trọng (%)", "SEU"],
+                [
+                    [
+                        str(row.get("use", "—")),
+                        _format_number(row.get("gj")),
+                        _format_number(row.get("toe"), 3),
+                        _format_number(row.get("share_pct")),
+                        "Có" if row.get("is_seu") else "Không",
+                    ]
+                    for row in rows
+                ],
+            )
+        )
+    outputs = [
+        [label, _format_number(item.get("gj")), _format_number(item.get("toe"), 3)]
+        for key, label in (("steam", "Hơi"), ("cooling", "Lạnh"))
+        if (item := (result.get("outputs") or {}).get(key)) and item.get("rows")
+    ]
+    if outputs:
+        blocks.append(_Table(["Đầu ra hữu ích", "GJ", "TOE"], outputs))
+    for warning in result.get("warnings", []):
+        blocks.append(f"Lưu ý: {warning}")
+    return blocks
+
+
+def _tariff_report_blocks(tariff_run: dict[str, Any]) -> list[_ReportBlock]:
+    """Tạo các khối tóm tắt chi phí TOU, hệ số phụ tải và chất lượng điện."""
+    result = tariff_run.get("result", {})
+    blocks: list[_ReportBlock] = [f"Lần tính biểu giá & chất lượng điện {tariff_run.get('run_id', '—')}"]
+    if not result.get("available"):
+        blocks.append(result.get("reason") or "Chưa đủ dữ liệu biểu giá và chất lượng điện.")
+        return blocks
+
+    period_labels = {"peak": "Cao điểm", "normal": "Bình thường", "off_peak": "Thấp điểm"}
+    summary = [
+        f"Chi phí TOU ước tính {_format_number(result.get('estimated_cost_vnd'), 0)} VNĐ "
+        f"(cao điểm {_format_number(result.get('peak_share_pct'))}%)",
+        f"Tiết kiệm ước tính khi dịch tải {_format_number(result.get('shift_savings_vnd'), 0)} VNĐ",
+        f"Công suất đỉnh {_format_number(result.get('peak_demand_kw'))} kW · "
+        f"Hệ số phụ tải {_format_number(result.get('load_factor'), 3)} · "
+        f"cos φ trung bình {_format_number(result.get('mean_power_factor'), 3)}",
+    ]
+    if result.get("pf_rows"):
+        summary.append(
+            f"cos φ dưới ngưỡng tại {result.get('low_pf_records', 0)} bản ghi · "
+            f"Tiền phản kháng ước tính {_format_number(result.get('reactive_penalty_vnd'), 0)} VNĐ · "
+            f"Dung lượng bù sơ bộ {_format_number(result.get('compensation_kvar'))} kVAr"
+        )
+    blocks.append(summary)
+    if tou_rows := result.get("tou"):
+        blocks.append(
+            _Table(
+                ["Khung giờ", "Bản ghi", "kWh", "VNĐ/kWh", "Chi phí ước tính (VNĐ)"],
+                [
+                    [
+                        period_labels.get(row.get("period", ""), str(row.get("period", "—"))),
+                        str(row.get("rows", 0)),
+                        _format_number(row.get("kwh")),
+                        _format_number(row.get("rate_vnd_per_kwh"), 0),
+                        _format_number(row.get("cost_vnd"), 0),
+                    ]
+                    for row in tou_rows
+                ],
+            )
+        )
+    for warning in result.get("warnings", []):
+        blocks.append(f"Lưu ý: {warning}")
     return blocks
 
 
@@ -500,6 +633,13 @@ def _report_sections(
             "Đường cơ sở năng lượng và chênh lệch ước tính",
             _baseline_report_blocks(baseline_run),
         ))
+    extra_sections: list[tuple[str, list[_ReportBlock]]] = []
+    if balance_run := report_data.get("energy_balance"):
+        extra_sections.append(("Cân bằng năng lượng (GJ/TOE) và hiệu suất", _energy_balance_report_blocks(balance_run)))
+    if tariff_run := report_data.get("tariff_power_quality"):
+        extra_sections.append(("Biểu giá TOU và chất lượng điện", _tariff_report_blocks(tariff_run)))
+    for offset, section in enumerate(extra_sections):
+        sections.insert(4 + offset, section)
     audit_rows = audit_summary_rows(report_data.get("reported_audit", {}))
     if audit_rows:
         sections.insert(2, ("Vận hành, nhiệt và phát thải", [

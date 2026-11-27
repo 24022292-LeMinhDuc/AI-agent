@@ -1,5 +1,6 @@
 """Kiểm tra đường cơ sở từ công cụ đến hồ sơ bằng chứng."""
 
+import json
 from io import BytesIO
 from pathlib import Path
 
@@ -82,4 +83,49 @@ def test_baseline_rejects_invalid_schema_without_execution(
     response = run_tool("energy_baseline", bad_args, {"mapping_confirmed": True})
 
     assert "drivers" in response["error"]
+    assert not db_path.exists()
+
+
+def test_baseline_records_mv_settings_and_adjustments_as_strict_json(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    dates = pd.date_range("2026-01-01", periods=10)
+    measured = pd.DataFrame({
+        "timestamp": dates, "production_t": [1, 2, 3, 4, 5, 6, 2, 3, 4, 5],
+        "kwh_total": [102, 104, 106, 108, 110, 112, 94, 96, 98, 100],
+    })
+    adjustment = {
+        "start_date": "2026-01-07", "end_date": "2026-01-08",
+        "delta_kwh_per_day": 2, "reason": "Bổ sung tải",
+    }
+    args = {**BASELINE_ARGS, "model_type": "auto", "non_routine_adjustments": [adjustment]}
+    scope = "mv-test"
+    store = {
+        "df": measured, "mapping_confirmed": True, "run_scope_id": scope,
+        "config": {"mv_standards": {"confidence_level": 0.8, "daily": {"max_cv_rmse_pct": 20}}},
+    }
+    response = run_tool("energy_baseline", args, store)
+    run = db.get_run(response["run_id"], scope_id=scope)
+    result = run["result"]
+    assert run["args"] == args
+    assert result == response["result"]
+    assert result["ashrae14_check"]["max_cv_rmse_pct"] == 20
+    assert result["uncertainty"]["confidence_level"] == 0.8
+    assert result["nra_total_kwh"] == 4
+    assert result["summary"]["savings_kwh"] == pytest.approx(44)
+    assert result["cusum_series"][-1]["cusum_kwh"] == pytest.approx(-44)
+    json.dumps(result, allow_nan=False)
+    model_result = _model_result("energy_baseline", result)
+    assert model_result["nra_total_kwh"] == 4
+    assert "cusum_series" not in model_result and "non_routine_adjustments" not in model_result
+
+
+def test_baseline_rejects_additional_nra_properties_without_logging(tmp_path, monkeypatch):
+    db_path = tmp_path / "runs.db"
+    monkeypatch.setattr(db, "DB_PATH", db_path)
+    args = {**BASELINE_ARGS, "non_routine_adjustments": [{
+        "start_date": "2026-01-07", "end_date": "2026-01-08",
+        "delta_kwh_per_day": 2, "reason": "Bổ sung tải", "approved": True,
+    }]}
+    response = run_tool("energy_baseline", args, {"mapping_confirmed": True})
+    assert "non_routine_adjustments.0" in response["error"]
     assert not db_path.exists()

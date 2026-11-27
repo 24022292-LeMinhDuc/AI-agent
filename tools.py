@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from math import isfinite
 
@@ -12,6 +14,17 @@ import pandas as pd
 REPORTING_TIMEZONE = "Asia/Ho_Chi_Minh"
 TOTAL_METER = "kwh_total"
 KW_PER_REFRIGERATION_TON = 3.51685284
+GJ_PER_KWH = 0.0036
+GJ_PER_TOE = 41.868
+FUEL_TYPES = ("biomass", "coal", "do_oil", "fo_oil", "lpg", "cng")
+_FUEL_NAMES = {
+    **{name.replace("_", " "): name for name in FUEL_TYPES},
+    "than da": "coal", "do": "do_oil", "fo": "fo_oil", "khi tu nhien": "cng",
+}
+_PERIOD_NAMES = {
+    "cao diem": "peak", "peak": "peak", "binh thuong": "normal", "normal": "normal",
+    "thap diem": "off_peak", "off peak": "off_peak",
+}
 _AUDIT_METRICS = {
     "energy_cost_vnd": ("energy_cost_vnd", "sum"),
     "peak_demand_kw": ("peak_demand_kw", "max"),
@@ -57,6 +70,13 @@ def finite_readings(values: pd.Series) -> pd.Series:
     """Chuẩn hóa số hữu hạn, chuyển số không đọc được thành ô thiếu."""
     numeric = pd.to_numeric(values, errors="coerce").astype(float)
     return numeric.where(np.isfinite(numeric))
+
+
+def normalize_label(value: object) -> str:
+    text = str(value).lower().replace("đ", "d")
+    decomposed = unicodedata.normalize("NFD", text)
+    without_marks = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
+    return re.sub(r"[^a-z0-9]+", " ", without_marks).strip()
 
 
 def resolve_measurement_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -358,6 +378,263 @@ def total_kwh(
     return _row_energy_total(_energy_readings(df, columns), require_complete=require_complete)
 
 
+def _audit_readings(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, str | None, dict]:
+    rows, quality = resolve_measurement_rows(df)
+    if "timestamp" in rows:
+        dates = reporting_timestamps(rows["timestamp"])
+        quality["invalid_timestamp_rows"] = int(dates.isna().sum())
+        rows = rows.assign(timestamp=dates).dropna(subset=["timestamp"])
+    rows = rows.reset_index(drop=True)
+    meters = [column for column in rows if str(column).startswith("kwh_")]
+    energy = _energy_readings(rows, meters)
+    boundary = total_meter_columns(rows, meters)
+    total = (_row_energy_total(energy[boundary], require_complete=True) if boundary
+             else pd.Series(float("nan"), index=rows.index))
+    return rows, energy, total, _total_source(boundary), quality
+
+
+def _reading(df: pd.DataFrame, column: str) -> pd.Series:
+    values = finite_readings(df[column]) if column in df else pd.Series(float("nan"), index=df.index)
+    return values.where(values.ge(0))
+
+
+def _energy_amount(series: pd.Series) -> dict:
+    gj = _optional_number(series.sum(min_count=1))
+    return {"gj": gj, "toe": gj / GJ_PER_TOE if gj is not None else None, "rows": int(series.count())}
+
+
+def _availability(available: bool, reason: str) -> dict:
+    return {"available": bool(available), "reason": None if available else reason}
+
+
+def _audit_warnings(quality: Mapping) -> list[str]:
+    warnings = []
+    if quality["conflicting_timestamp_rows"]:
+        warnings.append(f"Đã loại {quality['conflicting_timestamp_rows']} dòng xung đột tại cùng mốc đo. "
+                        "Cần mốc riêng cho các khoảng đo thuộc khung giá khác nhau.")
+    if quality.get("invalid_timestamp_rows"):
+        warnings.append(f"Đã loại {quality['invalid_timestamp_rows']} dòng thiếu thời gian hợp lệ.")
+    return warnings
+
+
+def energy_balance_analysis(df: pd.DataFrame, config: Mapping, fuel_type: str | None = None) -> dict:
+    """Cân bằng năng lượng đầu vào theo NCV và tính hiệu suất trên số đo ghép cặp."""
+    rows, energy, total, boundary, quality = _audit_readings(df)
+    branches = energy[submeter_columns(energy.columns)]
+    electric = _energy_amount(total * GJ_PER_KWH)
+    # Chỉ phân bổ nhánh trong khoảng có công tơ biên, giữ phần dư riêng.
+    subtotal = branches.sum(axis=1)
+    excess = total.notna() & subtotal.gt(total + 1e-9)
+    allocatable = total.notna() & ~excess
+    allocation = branches.loc[allocatable].sum(min_count=1).dropna().mul(GJ_PER_KWH).to_dict()
+    if electric["gj"] is not None:
+        residual = electric["gj"] - sum(allocation.values())
+        if residual > 1e-10 or not allocation:
+            allocation["unallocated_electricity"] = max(0., residual)
+
+    mass = _reading(rows, "boiler_fuel_kg")
+    default = config.get("default_boiler_fuel", "biomass")
+    if fuel_type is None and "fuel_type" in rows:
+        names = rows["fuel_type"].astype("string").str.strip().replace("", pd.NA).fillna(default)
+    else:
+        names = pd.Series(fuel_type or default, index=rows.index, dtype="string")
+    fuels = names.map(normalize_label).map(_FUEL_NAMES)
+    properties = config.get("fuel_properties", {})
+    heat = pd.Series(float("nan"), index=rows.index)
+    fuel_rows = []
+    for name, group in mass.groupby(fuels):
+        prop = properties.get(name, {})
+        ncv = prop.get("ncv_gj_per_kg")
+        if not group.notna().any() or ncv is None or not isfinite(ncv) or ncv <= 0:
+            continue
+        gj = group * ncv
+        heat.loc[group.index] = gj
+        amount = _energy_amount(gj)
+        factor = prop.get("co2_kg_per_gj")
+        fuel_rows.append({
+            "fuel_type": name, "kg": float(group.sum()), **amount, "ncv_gj_per_kg": ncv,
+            "co2_kg_per_gj": factor,
+            "combustion_co2_kg": amount["gj"] * factor if factor is not None else None,
+        })
+    unknown_mass = float(mass[heat.isna()].sum())
+    enthalpy = config.get("steam_enthalpy_gj_per_t", 2.76)
+    if not isfinite(enthalpy) or enthalpy <= 0:
+        raise ValueError("Nhiệt hữu ích mỗi tấn hơi phải là số dương hữu hạn.")
+    steam = _reading(rows, "steam_t") * enthalpy
+    cooling = _reading(rows, "cooling_load_rth") * KW_PER_REFRIGERATION_TON * GJ_PER_KWH
+    paired = heat.gt(0) & steam.notna()
+    boiler = float(100 * steam[paired].sum() / heat[paired].sum()) if paired.any() else None
+    chiller = _chiller_performance(rows, energy) or {}
+    kw_rt = chiller.get("kw_per_rt")
+
+    flows = [("electricity", key, value) for key, value in allocation.items()]
+    flows.extend((row["fuel_type"], "boiler", row["gj"]) for row in fuel_rows)
+    nodes = list(dict.fromkeys(node for source, target, _ in flows for node in (source, target)))
+    links = [{"source": nodes.index(source), "target": nodes.index(target), "value": value}
+             for source, target, value in flows if value > 0]
+    uses = dict(allocation)
+    if fuel_rows:
+        uses["boiler"] = sum(row["gj"] for row in fuel_rows)
+    input_gj = sum(uses.values()) if uses else None
+    ranked = []
+    cumulative = 0.
+    for key, gj in sorted(uses.items(), key=lambda item: -item[1]):
+        share = 100 * gj / input_gj if input_gj else None
+        ranked.append({"use": key, "gj": gj, "toe": gj / GJ_PER_TOE, "share_pct": share,
+                       "is_seu": gj > 0 and cumulative < 100 * config.get("seu_threshold", .8)})
+        cumulative += share or 0
+    available = input_gj is not None or steam.notna().any() or cooling.notna().any()
+    warnings = _audit_warnings(quality)
+    sections = {
+        "boiler": _availability(boiler is not None, "Cần kg nhiên liệu có nhiệt trị và tấn hơi ở cùng khoảng đo."),
+        "chiller": _availability(kw_rt is not None, "Cần điện chiller và tải lạnh RTh dương ở cùng khoảng đo."),
+    }
+    if unknown_mass:
+        warnings.append(f"{unknown_mass:g} kg nhiên liệu chưa xác định được nhiệt trị.")
+    if excess.any():
+        warnings.append("Có khoảng tổng công tơ nhánh vượt công tơ tổng. Điện của khoảng này được giữ ở phần chưa phân bổ.")
+    if boiler is not None and boiler > 100:
+        warnings.append("Hiệu suất lò vượt 100%. Kiểm tra nhiệt trị, nhiệt hữu ích và ranh giới đo.")
+    return {
+        **_availability(available, " ".join(warnings) or "Thiếu số đo điện, nhiên liệu quy đổi được, hơi hoặc tải lạnh."),
+        "total_input_gj": input_gj, "total_input_toe": input_gj / GJ_PER_TOE if input_gj is not None else None,
+        "electricity": electric, "electricity_source": boundary, "fuels": fuel_rows,
+        "unconverted_fuel_kg": unknown_mass, "overmetered_rows": int(excess.sum()),
+        "electric_branches": {key: _energy_amount(branches[key] * GJ_PER_KWH) for key in branches},
+        "outputs": {"steam": _energy_amount(steam), "cooling": _energy_amount(cooling)},
+        "boiler_efficiency_pct": boiler, "boiler_paired_rows": int(paired.sum()), "steam_enthalpy_gj_per_t": enthalpy,
+        "chiller_kw_per_rt": kw_rt, "chiller_cop": chiller.get("cop"), "chiller_paired_rows": chiller.get("paired_rows", 0),
+        "chiller_rating": None if kw_rt is None else ("Tốt" if kw_rt < .70 else "Trung bình" if kw_rt <= .85 else "Kém"),
+        "sankey_nodes": nodes, "sankey_links": links, "seu_breakdown": ranked,
+        "default_boiler_fuel": default, "fuel_override": fuel_type, "seu_threshold": config.get("seu_threshold", .8),
+        "warnings": warnings, "interval_quality": quality, "sections": sections,
+    }
+
+
+def _tariff_periods(df: pd.DataFrame) -> pd.Series:
+    labels = df.get("tariff_period", pd.Series(index=df.index, dtype="string"))
+    return labels.map(normalize_label, na_action="ignore").map(_PERIOD_NAMES)
+
+
+def _row_prices(periods: pd.Series, tariff) -> pd.Series:
+    if isinstance(tariff, Mapping):
+        rates = periods.map(tariff)
+    else:
+        rates = pd.Series(tariff, index=periods.index, dtype="float64")
+    rates = finite_readings(rates)
+    return rates.where(rates.ge(0))
+
+
+def _weighted_price(kwh: pd.Series, rates: pd.Series) -> float | None:
+    """Đơn giá bình quân chỉ dùng khi mọi kWh dương đều có giá."""
+    if (kwh.gt(0) & rates.isna()).any() or kwh.sum() <= 0:
+        return None
+    return float((kwh * rates).sum() / kwh.sum())
+
+
+def tariff_and_power_quality_analysis(df: pd.DataFrame, config: Mapping) -> dict:
+    """Phân tích điện năng theo nhãn TOU và chất lượng điện trên cùng khoảng đo."""
+    rows, _, total, boundary, quality = _audit_readings(df)
+    times = rows.get("timestamp", pd.Series(pd.NaT, index=rows.index, dtype="datetime64[ns]"))
+    periods = _tariff_periods(rows)
+    tariff = config.get("tariff_vnd_per_kwh")
+    rates = _row_prices(periods, tariff)
+    costs = total * rates
+    known = total.notna() & periods.notna()
+    unknown = total.notna() & periods.isna()
+    breakdown = []
+    for period in ("peak", "normal", "off_peak"):
+        mask = known & periods.eq(period)
+        price = tariff.get(period) if isinstance(tariff, Mapping) else tariff
+        kwh = float(total[mask].sum()) if known.any() else None
+        breakdown.append({"period": period, "rows": int(mask.sum()), "kwh": kwh, "rate_vnd_per_kwh": price,
+                          "cost_vnd": kwh * price if kwh is not None and price is not None and price >= 0 else None})
+    priced = _optional_number(costs.sum(min_count=1))
+    estimated = None if (total.gt(0) & rates.isna()).any() else priced
+    peak_kwh = breakdown[0]["kwh"]
+    peak_share = 100 * peak_kwh / total.sum() if known.any() and not total[unknown].sum() and total.sum() > 0 else None
+    peak_rate, off_rate = breakdown[0]["rate_vnd_per_kwh"], breakdown[2]["rate_vnd_per_kwh"]
+    shift = None
+    if peak_share is not None and peak_rate is not None and off_rate is not None:
+        shift = .10 * peak_kwh * max(0., peak_rate - off_rate)
+
+    profile = pd.DataFrame({"month": times.dt.strftime("%Y-%m").fillna("Toàn bộ"), "period": periods, "kwh": total})
+    profile = profile[known].groupby(["month", "period"], as_index=False)["kwh"].sum()
+    demand = _reading(rows, "peak_demand_kw")
+    peak = _optional_number(demand.max())
+    peak_time = times[demand.eq(peak)].min() if peak is not None else pd.NaT
+    intervals = times.sort_values().diff().dropna().unique()
+    load_factor = hours = None
+    load_reason = "Cần kWh và đỉnh kW đủ trên các khoảng đo đều, liên tiếp, tối đa một ngày mỗi khoảng."
+    warnings = _audit_warnings(quality)
+    if len(intervals) == 1 and times.notna().all() and total.notna().all() and demand.notna().all() and peak:
+        step = pd.Timedelta(intervals[0]) / pd.Timedelta(hours=1)
+        if 0 < step <= 24:
+            hours = float(step * len(rows))
+            load_factor = float(total.sum() / (hours * peak))
+            if load_factor > 1 + 1e-9:
+                load_factor = None
+                load_reason = "Công suất trung bình từ kWh vượt đỉnh kW. Kiểm tra đơn vị, khoảng đo và ranh giới điện."
+                warnings.append(load_reason)
+
+    policy = config.get("power_factor_penalty", {})
+    target = float(policy.get("min_pf", .90))
+    demand_rate = float(policy.get("demand_charge_vnd_per_kw", 0))
+    if not 0 < target <= 1 or not isfinite(demand_rate) or demand_rate < 0:
+        raise ValueError("Ngưỡng cos φ phải trong (0, 1] và đơn giá công suất phải không âm, hữu hạn.")
+    pf = _reading(rows, "power_factor")
+    pf = pf.where(pf.gt(0) & pf.le(1))
+    low = pf.lt(target)
+    surcharge = costs[low] * (target / pf[low] - 1)
+    unknown_pf = pf.isna() & total.ne(0)
+    penalty = (float(surcharge.sum()) if pf.notna().any() and surcharge.notna().all()
+               and not unknown_pf.any() else None)
+    # Ghép kW và PF cùng bản ghi trước khi chọn nhu cầu bù lớn nhất.
+    kvar = demand[low] * (np.tan(np.arccos(pf[low])) - np.tan(np.arccos(target)))
+    alerts = pd.DataFrame({"day": times[low].dt.strftime("%Y-%m-%d").fillna("Chưa có ngày"),
+                           "pf": pf[low], "penalty": surcharge, "kvar": kvar})
+    daily = alerts.groupby("day").agg(records=("pf", "size"), min_pf=("pf", "min"), compensation_kvar=("kvar", "max"))
+    daily["penalty_vnd"] = alerts.groupby("day")["penalty"].sum(min_count=1)
+    incomplete_days = times[unknown_pf | (low & costs.isna())].dt.strftime("%Y-%m-%d").fillna("Chưa có ngày")
+    daily.loc[daily.index.isin(incomplete_days), "penalty_vnd"] = np.nan
+    monthly_peaks = demand.groupby(times.dt.to_period("M")).max().dropna()
+    reported = _reading(rows, "energy_cost_vnd")
+    reported_cost = _optional_number(reported.sum(min_count=1))
+    cost_difference = costs - reported
+    sections = {
+        "tou": _availability(known.any(), "Cần kWh và nhãn khung giờ hợp lệ trên cùng khoảng đo."),
+        "demand": _availability(peak is not None, "Thiếu số đo công suất đỉnh kW hợp lệ."),
+        "load_factor": _availability(load_factor is not None, load_reason),
+        "power_factor": _availability(pf.notna().any(), "Cần cos φ đo được trong khoảng (0, 1]."),
+    }
+    if known.any() and (total.gt(0) & rates.isna()).any():
+        warnings.append("Có kWh chưa xác định đơn giá. Bảng chi phí chỉ phản ánh các khoảng đã ghép được giá.")
+    if total.notna().any() and total.isna().any():
+        warnings.append("Có khoảng thiếu điện năng tại ranh giới đo. Kết quả TOU dùng các khoảng đủ điện.")
+    if pf.notna().any() and (unknown_pf.any() or surcharge.isna().any()):
+        warnings.append("Chưa đủ cos φ hoặc tiền điện theo khoảng để ước tính tiền phạt cả kỳ.")
+    available = bool(known.any() or peak is not None or pf.notna().any() or reported_cost is not None or priced is not None)
+    return {
+        **_availability(available, " ".join(warnings) or "Cần số đo có khung giá, chi phí, công suất đỉnh hoặc cos φ hợp lệ."),
+        "electricity_source": boundary, "tou": breakdown, "tou_profile": profile.to_dict("records"),
+        "peak_share_pct": peak_share, "shift_savings_vnd": shift, "shift_fraction": .10,
+        "estimated_cost_vnd": estimated, "priced_cost_vnd": priced, "reported_cost_vnd": reported_cost,
+        "cost_difference_vnd": _optional_number(cost_difference.sum(min_count=1)), "cost_paired_rows": int(cost_difference.count()),
+        "unclassified_kwh": float(total[unknown].sum()), "energy_rows": int(total.count()), "priced_rows": int(costs.count()),
+        "peak_demand_kw": peak, "peak_timestamp": peak_time.isoformat() if pd.notna(peak_time) else None,
+        "load_factor": load_factor, "period_hours": hours, "min_pf": target,
+        "mean_power_factor": _optional_number(pf.mean()), "pf_rows": int(pf.count()),
+        "low_pf_records": int(low.sum()) if pf.notna().any() else None,
+        "low_pf_days": int(times[low].dt.normalize().nunique()) if pf.notna().any() and times.notna().any() else None,
+        "reactive_penalty_vnd": penalty, "penalty_priced_rows": int(surcharge.count()),
+        "compensation_kvar": _optional_number(kvar.max()) if low.any() else (0. if pf.notna().any() else None),
+        "demand_charge_vnd": float(monthly_peaks.sum() * demand_rate) if len(monthly_peaks) else None,
+        "demand_charge_vnd_per_kw": demand_rate,
+        "pf_alerts": daily.reset_index().astype(object).where(lambda table: table.notna(), None).to_dict("records"),
+        "interval_quality": quality, "warnings": warnings, "sections": sections,
+    }
+
+
 def dataset_summary(
     df: pd.DataFrame, kwh_cols: Sequence[str], *, audit_df: pd.DataFrame | None = None,
 ) -> dict[str, object]:
@@ -414,7 +691,7 @@ def dashboard_analysis(
     kwh_cols: Sequence[str],
     start_date: str,
     end_date: str,
-    tariff_vnd_per_kwh: float | None,
+    tariff_vnd_per_kwh: float | Mapping[str, float] | None,
     *,
     audit_df: pd.DataFrame | None = None,
 ) -> dict[str, object]:
@@ -454,7 +731,17 @@ def dashboard_analysis(
     )
     total_value = float(total_energy) if pd.notna(total_energy) else None
     production_value = float(production) if pd.notna(production) else None
-    tariff_value = float(tariff_vnd_per_kwh) if tariff_vnd_per_kwh is not None else None
+    if isinstance(tariff_vnd_per_kwh, Mapping):
+        row_rates = _row_prices(_tariff_periods(filtered_df), tariff_vnd_per_kwh)
+        tariff_value = _weighted_price(matched_energy, row_rates)
+        estimated_cost = _optional_number((matched_energy * row_rates).sum(min_count=1))
+        if (matched_energy.gt(0) & row_rates.isna()).any():
+            estimated_cost = None
+        if _row_energy_total(energy[total_columns]).gt(0).where(matched_energy.isna(), False).any():
+            tariff_value = estimated_cost = None
+    else:
+        tariff_value = float(tariff_vnd_per_kwh) if tariff_vnd_per_kwh is not None else None
+        estimated_cost = total_value * tariff_value if total_value is not None and tariff_value is not None else None
 
     return {
         "aggregated": aggregated,
@@ -477,11 +764,7 @@ def dashboard_analysis(
             "intensity_rows": int(paired_rows.sum()),
             "average_temp_c": float(temperature) if pd.notna(temperature) else None,
             "tariff_vnd_per_kwh": tariff_value,
-            "estimated_cost_vnd": (
-                total_value * tariff_value
-                if total_value is not None and tariff_value is not None
-                else None
-            ),
+            "estimated_cost_vnd": estimated_cost,
         },
     }
 
@@ -675,12 +958,14 @@ def opportunity(
     name: str,
     base_kwh: float | None,
     saving_pct: float,
-    tariff: float,
+    tariff: float | None,
     capex: float,
     emission_factor: float | None,
 ) -> dict[str, object]:
     """Ước tính tiết kiệm năng lượng, chi phí, phát thải và hoàn vốn."""
-    assumptions = {"Giá điện": tariff, "Vốn đầu tư": capex}
+    assumptions = {"Vốn đầu tư": capex}
+    if tariff is not None:
+        assumptions["Giá điện"] = tariff
     if base_kwh is not None:
         assumptions["Điện năng cơ sở"] = base_kwh
     if emission_factor is not None:
@@ -692,7 +977,7 @@ def opportunity(
         raise ValueError("Tỷ lệ tiết kiệm phải nằm trong khoảng từ 0 đến 1.")
 
     saved_kwh = float(base_kwh * saving_pct) if base_kwh is not None else None
-    saved_vnd = float(saved_kwh * tariff) if saved_kwh is not None else None
+    saved_vnd = float(saved_kwh * tariff) if saved_kwh is not None and tariff is not None else None
     co2_tonnes = (
         float(saved_kwh * emission_factor / 1000)
         if emission_factor is not None and saved_kwh is not None
@@ -708,9 +993,10 @@ def opportunity(
         if emission_factor is None
         else f"hệ số phát thải {emission_factor:g} kg/kWh"
     )
+    price_note = f"giá điện {tariff:,.0f} VND/kWh" if tariff is not None else "thiếu đơn giá cho điện quan sát"
     assumption = (
         f"GIẢ ĐỊNH - cần kiểm chứng: {name}; tỷ lệ tiết kiệm {saving_pct:.1%}; "
-        f"giá điện {tariff:,.0f} VND/kWh; vốn đầu tư {capex:,.0f} VND; "
+        f"{price_note}; vốn đầu tư {capex:,.0f} VND; "
         f"{emission_assumption}. Tiết kiệm tiền là ước tính mỗi năm; "
         "ROI (%) = tiết kiệm tiền năm / vốn đầu tư × 100; "
         "hoàn vốn (tháng) = vốn đầu tư / tiết kiệm tiền năm × 12."
@@ -727,19 +1013,185 @@ def opportunity(
     }
 
 
-def list_opportunities(
+
+def evaluate_ecm_financials(opportunity: dict, financial_assumptions: dict, ghg_assumptions: dict) -> dict:
+    """Tính toán toàn bộ chỉ số tài chính và GHG cho một cơ hội ECM.
+
+    Parameters
+    ----------
+    opportunity: dict
+        Dữ liệu cơ hội (saving_pct, capex_vnd, applies_to, …).
+    financial_assumptions: dict
+        Các giả định tài chính toàn cục (discount_rate, energy_escalation_rate, …).
+    ghg_assumptions: dict
+        Giả định GHG (default_grid_ef_kgco2e_per_kwh, renewable_electricity_share_pct, irec_kwh).
+
+    Returns
+    -------
+    dict
+        Đối tượng cơ hội đã bổ sung:
+        - annual_kwh_saved, annual_cost_saved_vnd, annual_co2_saved_t
+        - simple_payback_years, discounted_payback_years, npv_vnd, irr_pct, sir, mac_vnd_per_tco2e
+        - ghg_scope1_tco2e, ghg_scope2_location_tco2e, ghg_scope2_market_tco2e, total_emissions_tco2e
+    """
+    # ------------------------------------------------------------------
+    # 1️⃣ Annualisation (kWh saved) – dựa trên dữ liệu năm (đơn vị kWh)
+    # ------------------------------------------------------------------
+    coverage_days = opportunity.get("coverage_days", 365)  # giả sử có trường này, nếu không thì dùng 365
+    total_kwh = opportunity.get("annual_kwh", None)
+    if total_kwh is None:
+        # Nếu không có dữ liệu đầy đủ, dùng saving_pct * kwh_total hiện có (được truyền từ UI)
+        total_kwh = opportunity.get("kwh_total", 0) * opportunity.get("saving_pct", 0)
+    if coverage_days >= 330:
+        annual_kwh_saved = total_kwh
+        annualization_method = "direct"
+    else:
+        # extrapolate
+        daily_avg = total_kwh / coverage_days if coverage_days else 0
+        annual_kwh_saved = daily_avg * 365
+        annualization_method = "extrapolated_warning"
+    # ------------------------------------------------------------------
+    # 2️⃣ Energy cost & CO₂ saved (sử dụng giả định giá năng lượng)
+    # ------------------------------------------------------------------
+    tariff = opportunity.get("tariff_vnd_per_kwh", 0)
+    annual_cost_saved = annual_kwh_saved * tariff
+    # cỡ CO₂ tiết kiệm = kWh_saved * grid emission factor (kgCO2e/kWh) -> tCO2e
+    grid_ef = ghg_assumptions.get("default_grid_ef_kgco2e_per_kwh", 0.6592)
+    annual_co2_saved = annual_kwh_saved * grid_ef / 1000  # tCO2e
+    # ------------------------------------------------------------------
+    # 3️⃣ Cash‑flow projection (CAPEX, OPEX, savings) trong thời gian lifetime
+    # ------------------------------------------------------------------
+    lifetime = opportunity.get("lifetime_years") or financial_assumptions.get("default_lifetime_years", 10)
+    discount_rate = financial_assumptions.get("discount_rate", 0.10)
+    energy_escal = financial_assumptions.get("energy_escalation_rate", 0.03)
+    capex = opportunity.get("capex_vnd", 0)
+    # OPEX có thể được ghi đè per‑opportunity, nếu không thì % của CAPEX
+    annual_opex = opportunity.get("annual_opex_vnd")
+    if annual_opex is None:
+        annual_opex = capex * financial_assumptions.get("default_opex_pct_of_capex", 0.02)
+    # Cash‑flow list (năm 0 là CAPEX, các năm 1..lifetime là net savings)
+    cash_flows = [-capex]
+    for year in range(1, int(lifetime) + 1):
+        # Escalate energy cost savings each year
+        escalated_saving = annual_cost_saved * ((1 + energy_escal) ** (year - 1))
+        net = escalated_saving - annual_opex
+        cash_flows.append(net)
+    # ------------------------------------------------------------------
+    # 4️⃣ Tính NPV, IRR, Discounted Payback, SIR, MAC
+    # ------------------------------------------------------------------
+    npv = sum(cf / ((1 + discount_rate) ** i) for i, cf in enumerate(cash_flows))
+    # IRR via bisection on discount rate r where NPV(r)=0
+    def npv_at(r):
+        return sum(cf / ((1 + r) ** i) for i, cf in enumerate(cash_flows))
+    irr = None
+    # kiểm tra có dấu chuyển đổi không
+    if cash_flows[0] < 0 and any(cf > 0 for cf in cash_flows[1:]):
+        low, high = -0.99, 1.0  # r trong (-0.99, 1)
+        for _ in range(60):  # đủ độ chính xác 2**-60 ~ 1e-18
+            mid = (low + high) / 2
+            val = npv_at(mid)
+            if val > 0:
+                low = mid
+            else:
+                high = mid
+        irr = (low + high) / 2
+    # Simple payback (không chiết khấu)
+    cumulative = -capex
+    simple_payback = None
+    for i, cf in enumerate(cash_flows[1:], start=1):
+        cumulative += cf
+        if cumulative >= 0:
+            simple_payback = i
+            break
+    # Discounted payback
+    cumulative_disc = -capex
+    discounted_payback = None
+    for i, cf in enumerate(cash_flows[1:], start=1):
+        cumulative_disc += cf / ((1 + discount_rate) ** i)
+        if cumulative_disc >= 0:
+            discounted_payback = i
+            break
+    # SIR = (PV of benefits) / (PV of costs) = (NPV + CAPEX) / CAPEX
+    sir = (npv + capex) / capex if capex != 0 else None
+    # MAC = (CAPEX - NPV) / total CO2 saved (tCO2e)
+    mac = (capex - npv) / annual_co2_saved if annual_co2_saved != 0 else None
+    # ------------------------------------------------------------------
+    # 5️⃣ GHG Scope calculations (sử dụng dữ liệu nguyên liệu, kWh)
+    # ------------------------------------------------------------------
+    # Scope 1: dựa trên boiler_fuel_kg * fuel_ef (được truyền trong opportunity)
+    fuel_kg = opportunity.get("boiler_fuel_kg", 0)
+    fuel_type = opportunity.get("energy_carrier") or "electricity"
+    fuel_ef = 0.0
+    # Nếu fuel_type là electricity, không có Scope 1; nếu là fuel, lấy từ mapping trong mapping.py
+    if fuel_type != "electricity":
+        from mapping import fuel_properties
+        ef = fuel_properties.get(fuel_type, {}).get("co2_kg_per_gj", 0)
+        ncv = fuel_properties.get(fuel_type, {}).get("ncv_gj_per_kg", 0)
+        fuel_ef = ef * ncv  # kgCO2e per kg fuel
+    scope1 = fuel_kg * fuel_ef / 1000  # tCO2e
+    # Scope 2 location‑based
+    total_kwh_used = opportunity.get("kwh_total", 0)
+    scope2_loc = total_kwh_used * grid_ef / 1000  # tCO2e
+    # Scope 2 market‑based – áp dụng renewable share và I‑REC
+    renewable_share = ghg_assumptions.get("renewable_electricity_share_pct", 0.0) / 100
+    irec_kwh = ghg_assumptions.get("irec_kwh", 0.0)
+    # Điện tái tạo được trừ khỏi grid factor
+    market_factor = grid_ef * (1 - renewable_share)
+    scope2_mkt = (total_kwh_used - irec_kwh) * market_factor / 1000
+    total_emissions = scope1 + scope2_loc + scope2_mkt
+    # ------------------------------------------------------------------
+    # 6️⃣ Đóng gói kết quả
+    # ------------------------------------------------------------------
+    result = {
+        "annual_kwh_saved": annual_kwh_saved,
+        "annual_cost_saved_vnd": annual_cost_saved,
+        "annual_co2_saved_t": annual_co2_saved,
+        "annualization_method": annualization_method,
+        "simple_payback_years": simple_payback,
+        "discounted_payback_years": discounted_payback,
+        "npv_vnd": npv,
+        "irr_pct": irr * 100 if irr is not None else None,
+        "sir": sir,
+        "mac_vnd_per_tco2e": mac,
+        # GHG
+        "ghg_scope1_tco2e": scope1,
+        "ghg_scope2_location_tco2e": scope2_loc,
+        "ghg_scope2_market_tco2e": scope2_mkt,
+        "total_emissions_tco2e": total_emissions,
+    }
+    return {**opportunity, **result}
+
+def calculate_sample_opportunities(
     df: pd.DataFrame,
     opportunities: Sequence[Mapping[str, object]],
-    tariff: float,
+    tariff: float | Mapping[str, float],
     emission_factor: float | None,
 ) -> list[dict[str, object]]:
-    """Tính cơ hội mẫu theo điện tiêu thụ quy đổi năm."""
+    """Tính cơ hội mẫu theo điện tiêu thụ quy đổi năm.
+
+    Được thiết kế để chịu lỗi khi:
+    • Không có cột ``timestamp``.
+    • ``applies_to`` không tồn tại trong DataFrame.
+    • Không có ngày hợp lệ (``observed_days == 0``).
+    • ``row_rates`` tồn tại nhưng ``days`` là ``None``.
+    """
+    # Chuẩn hoá các hàng đo lường và giữ thông tin chất lượng (không thay đổi nội dung hiện tại)
     df, _ = resolve_measurement_rows(df)
+
+    # 1️⃣ Xác định ngày báo cáo – nếu không có cột timestamp thì để None
     days = (
         reporting_timestamps(df["timestamp"]).dt.normalize()
         if "timestamp" in df.columns
         else None
     )
+
+    # 2️⃣ Giá điện theo khung tarif – chỉ tính khi tariff là mapping và có dữ liệu thời gian hợp lệ
+    row_rates = (
+        _row_prices(_tariff_periods(df), tariff)
+        if isinstance(tariff, Mapping)
+        else None
+    )
+
     results: list[dict[str, object]] = []
     for item in opportunities:
         name = str(item["name"])
@@ -749,16 +1201,24 @@ def list_opportunities(
 
         base_kwh_annual = None
         observed_days = 0
+        # ------------------------------------------------------------
+        # Kiểm tra cột ``applies_to`` tồn tại
+        # ------------------------------------------------------------
         if applies_to not in df.columns:
             annualization_note = f"Không tìm thấy cột {applies_to} trong dữ liệu."
+        # Kiểm tra có ngày đo lường để quy đổi
         elif days is None:
             annualization_note = "Cần thời gian đo để quy đổi tiêu thụ năm."
         else:
             consumption = finite_readings(df[applies_to])
+            # Chỉ giữ các dòng có ngày hợp lệ và tiêu thụ >= 0
             valid_rows = days.notna() & consumption.ge(0)
             observed_days = int(days.loc[valid_rows].nunique())
             if observed_days:
-                base_kwh_annual = float(consumption.loc[valid_rows].sum() / observed_days * 365)
+                # Tính tiêu thụ trung bình trên năm
+                base_kwh_annual = float(
+                    consumption.loc[valid_rows].sum() / observed_days * 365
+                )
                 annualization_note = (
                     f"Quy đổi bình quân {observed_days} ngày có số đo lên 365 ngày, "
                     "giả định số đo trong từng ngày đầy đủ và các ngày đại diện cho cả năm."
@@ -766,14 +1226,26 @@ def list_opportunities(
             else:
                 annualization_note = "Không có số đo kèm ngày hợp lệ để ước tính mức tiêu thụ năm."
 
+        # ------------------------------------------------------------
+        # Tính giá điện (tariff) – an toàn khi days None
+        # ------------------------------------------------------------
+        price = tariff
+        if row_rates is not None and days is not None:
+            # ``_reading`` trả về Series; .where(days.notna()) bảo an
+            price = _weighted_price(_reading(df, applies_to).where(days.notna()), row_rates)
+
+        # ------------------------------------------------------------
+        # Xây dựng kết quả cho cơ hội
+        # ------------------------------------------------------------
         result = opportunity(
             name=name,
             base_kwh=base_kwh_annual,
             saving_pct=saving_pct,
-            tariff=tariff,
+            tariff=price,
             capex=capex,
             emission_factor=emission_factor,
         )
+        # Thêm các trường bổ sung để UI hiển thị
         result["applies_to"] = applies_to
         result["base_kwh_annual"] = base_kwh_annual
         result["observed_days"] = observed_days

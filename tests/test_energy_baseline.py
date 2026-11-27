@@ -238,3 +238,162 @@ def test_rejects_unsuitable_periods_or_models(change: str, expected: str) -> Non
 
     with pytest.raises(ValueError, match=expected):
         normalized_baseline(source, ["kwh_production"], **args)
+
+
+def _fit_periods(source: pd.DataFrame, n: int, **kwargs) -> dict:
+    dates = source["timestamp"].dt.strftime("%Y-%m-%d")
+    return normalized_baseline(
+        source, ["kwh_total"],
+        baseline_start=dates.iloc[0], baseline_end=dates.iloc[n - 1],
+        reporting_start=dates.iloc[n], reporting_end=dates.iloc[-1],
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "heating_base", "cooling_base"),
+    [("3pc", None, 22), ("3ph", 19, None), ("4p", 20, 20), ("5p", 18, 24), ("auto", None, 22)],
+)
+def test_change_points_recover_known_breaks_and_operating_driver(
+    model_type: str, heating_base: float | None, cooling_base: float | None,
+) -> None:
+    temp = np.tile(np.arange(10., 31., 0.5), 3)
+    hours = 8 + np.arange(len(temp)) % 5
+    energy = 50 + 2 * hours.astype(float)
+    if heating_base is not None:
+        energy += 3 * np.maximum(heating_base - temp, 0)
+    if cooling_base is not None:
+        energy += 4 * np.maximum(temp - cooling_base, 0)
+    energy[84:] -= 10
+    source = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01", periods=len(temp)),
+        "temp_c": temp, "operating_hours": hours, "kwh_total": energy,
+    })
+    result = _fit_periods(source, 84, drivers=["operating_hours"], model_type=model_type)
+    model = result["model"]
+    assert model["model_type"] == ("3pc" if model_type == "auto" else model_type)
+    expected_break = {"heating": 18, "cooling": 24} if model_type == "5p" else (
+        cooling_base if cooling_base is not None else heating_base
+    )
+    assert model["balance_temp_c"] == expected_break
+    assert model["coefficients"]["operating_hours"] == pytest.approx(2)
+    assert result["summary"]["savings_kwh"] == pytest.approx(420)
+    assert result["ashrae14_check"]["passed"]
+    json.dumps(result, allow_nan=False)
+
+
+def test_hdd_uses_configurable_base_and_accepts_negative_outdoor_temperatures() -> None:
+    temp = np.array([-5, 0, 3, 10, 15, 18, 20, 0, 10, 18])
+    energy = 40 + 7 * np.maximum(16 - temp, 0)
+    source = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01", periods=len(temp)),
+        "temp_c": temp, "kwh_total": energy,
+    })
+    result = _fit_periods(source, 7, drivers=["hdd"], hdd_base_temp_c=16)
+    assert result["model"]["coefficients"]["hdd"] == pytest.approx(7)
+    assert result["reporting"]["eligible_rows"] == 3
+    assert result["model"]["hdd_base_temp_c"] == 16
+
+
+def test_vif_of_correlated_drivers_matches_inverse_correlation() -> None:
+    production = np.arange(1., 41.)
+    hours = 6 + production / 4 + np.sin(production) / 4
+    energy = 80 + 3 * production + 2 * hours + np.cos(production)
+    source = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01", periods=len(production)),
+        "production_t": production, "operating_hours": hours, "kwh_total": energy,
+    })
+    result = _fit_periods(source, 35, drivers=["production_t", "operating_hours"])
+    expected = 1 / (1 - np.corrcoef(production[:35], hours[:35])[0, 1] ** 2)
+    rows = {row["feature"]: row for row in result["coefficients"]}
+    assert rows["intercept"]["vif"] is None
+    for name in ("production_t", "operating_hours"):
+        assert rows[name]["vif"] == pytest.approx(expected)
+        assert rows[name]["p_value"] is not None
+    assert result["ashrae14_check"]["vif_warnings"] == ["production_t", "operating_hours"]
+
+
+def test_nra_and_cusum_use_only_matched_days_and_preserve_sign() -> None:
+    source = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01", periods=10),
+        "production_t": [1, 2, 3, 4, 5, 6, 2, 3, 4, 10],
+        "kwh_total": [102, 104, 106, 108, 110, 112, 99, 100, 103, 110],
+    })
+    adjustments = [
+        {"start_date": "2025-01-06", "end_date": "2025-01-10", "delta_kwh_per_day": 3, "reason": "Add load"},
+        {"start_date": "2025-01-08", "end_date": "2025-01-08", "delta_kwh_per_day": -2, "reason": "Remove load"},
+    ]
+    result = _fit_periods(source, 6, drivers=["production_t"], non_routine_adjustments=adjustments)
+    assert result["nra_total_kwh"] == 7
+    assert result["summary"]["expected_kwh"] == pytest.approx(318)
+    assert result["summary"]["savings_kwh"] == pytest.approx(23)
+    assert result["summary"]["savings_pct"] == pytest.approx(100 * 23 / 325)
+    assert result["monthly"][0]["nra_total_kwh"] == 7
+    assert [point["date"] for point in result["cusum_series"]] == ["2025-01-07", "2025-01-08", "2025-01-09"]
+    assert [point["daily_diff_kwh"] for point in result["cusum_series"]] == pytest.approx([-8, -7, -8])
+    assert [point["cusum_kwh"] for point in result["cusum_series"]] == pytest.approx([-8, -15, -23])
+
+
+@pytest.mark.parametrize(("noise", "passes"), [(1, True), (40, False)])
+def test_ashrae_daily_check_applies_configured_cv_rmse_threshold(noise: float, passes: bool) -> None:
+    production = np.tile([1, 2, 3, 4], 6)
+    residual = noise * np.tile([1, -1, -1, 1], 6)
+    source = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01", periods=len(production)),
+        "production_t": production, "kwh_total": 60 + 3 * production + residual,
+    })
+    result = _fit_periods(source, 20, drivers=["production_t"])
+    check = result["ashrae14_check"]
+    assert check["passed"] is passes
+    assert check["cv_rmse_pass"] is passes
+    assert check["nmbe_pass"] is True
+    assert check["granularity"] == "daily"
+
+
+def test_monthly_check_uses_only_full_baseline_months() -> None:
+    dates = pd.date_range("2025-01-02", "2025-06-05")
+    production = np.arange(len(dates)) % 7 + 1
+    source = pd.DataFrame({
+        "timestamp": dates, "production_t": production, "kwh_total": 120 + production * 4,
+    })
+    n = int((dates < "2025-06-01").sum())
+    result = _fit_periods(source, n, drivers=["production_t"], granularity="monthly")
+    check = result["ashrae14_check"]
+    assert check["granularity"] == "monthly"
+    assert check["observations"] == 4
+    assert check["max_cv_rmse_pct"] == 15
+    assert check["max_abs_nmbe_pct"] == 5
+    assert check["passed"] is True
+
+
+@pytest.mark.parametrize(("daily_savings", "significant"), [(15, True), (1, False)])
+def test_fsu_matches_annex_b_with_serial_correlation(daily_savings: float, significant: bool) -> None:
+    from scipy.stats import t
+
+    n, m = 60, 10
+    production = np.tile(np.arange(1., 11.), 7)
+    energy = 90 + 3 * production
+    energy[:n] += 4 * np.sin(np.arange(n) * 0.7)
+    energy[n:] -= daily_savings
+    source = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01", periods=n + m),
+        "production_t": production, "kwh_total": energy,
+    })
+    result = _fit_periods(source, n, drivers=["production_t"])
+    fitted = result["model"]["coefficients"]
+    fit = fitted["intercept"] + fitted["production_t"] * production[:n]
+    residual = energy[:n] - fit
+    rho = np.corrcoef(residual[1:], residual[:-1])[0, 1]
+    assert rho > 0.5
+    n_effective = n * (1 - rho) / (1 + rho)
+    dof = n_effective - 2
+    mse = np.sum(residual ** 2) / dof
+    summary = result["summary"]
+    scale = 1.26 * (summary["expected_kwh"] / m / energy[:n].mean()) * np.sqrt(mse * (1 + 2 / n_effective) * m)
+    uncertainty = result["uncertainty"]
+    assert uncertainty["rho"] == pytest.approx(rho)
+    assert uncertainty["n_effective"] == pytest.approx(n_effective)
+    for level in (90, 95):
+        half_width = t.ppf((1 + level / 100) / 2, dof) * scale
+        assert uncertainty[f"fsu_{level}_pct"] == pytest.approx(100 * half_width / summary["savings_kwh"])
+    assert result["statistically_significant_savings"] is significant

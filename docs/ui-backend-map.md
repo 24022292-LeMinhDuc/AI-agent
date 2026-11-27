@@ -6,10 +6,10 @@ Virtual Energy Engineer là ứng dụng phân tích dữ liệu điện lịch 
 |---|---|---|
 | **Dữ liệu** | Chọn mẫu nhà máy, tòa nhà, mẫu có lỗi hoặc nhập CSV/XLSX, kiểm tra ánh xạ và đơn vị | `mapping.py` nhận các nhóm thời gian, vận hành, biến EnB, điện, nhiệt, chi phí và phát thải. `tools.clean` ghi nhận dòng trùng, dòng xung đột, giá trị bị loại, nội suy và dữ liệu còn thiếu. |
 | **Dashboard** | Theo dõi theo ngày, tuần hoặc tháng, so sánh hai tháng và xem thời tiết theo giờ | `dashboard_analysis` cung cấp kWh, nhiệt độ từ tệp, sản lượng, chi phí ước tính và độ phủ. `compare_periods` đối chiếu tổng kWh và bình quân trên ngày có số đo theo từng công tơ. `weather_panel` dùng Open-Meteo cho địa điểm đã chọn. |
-| **SEU & EnPI** | Xác định hạng mục sử dụng năng lượng đáng kể, đánh giá hiệu suất và tính đường cơ sở | `seu_pareto` xếp hạng theo điện năng. `enpi_regression` tính kWh/tấn và hồi quy. `energy_baseline` ước tính điện tham chiếu tại điều kiện kỳ báo cáo và cho thấy chênh lệch với thực đo. |
-| **Cơ hội** | Xem giả định, so sánh phương án và ghi quyết định | `list_opportunities` ước tính điện và tiền tiết kiệm, ROI và hoàn vốn. SQLite lưu trạng thái đã duyệt hoặc từ chối. |
-| **Báo cáo** | Xem phạm vi và tải hồ sơ phân tích | `report.py` tạo DOCX, Markdown và JSON kèm thông tin về tệp nguồn, giả định, quyết định và mã lần chạy. Hồ sơ đưa vào kết quả đường cơ sở nếu phiên đã tính. |
-| **Hỏi đáp** | Đặt câu hỏi hoặc mở diễn giải từ một kết quả phân tích | `agent.ask` dùng kết quả đã tính của phiên. Đối chiếu tự động kiểm tra giá trị xuất hiện trong nội dung được trích dẫn. |
+| **SEU & EnPI** | Xác định hạng mục sử dụng năng lượng đáng kể, cân bằng GJ/TOE, biểu giá TOU, chất lượng điện và đường cơ sở | `seu_pareto` xếp hạng theo điện năng. `enpi_regression` tính kWh/tấn và hồi quy. `energy_balance_analysis` tính cân bằng GJ/TOE, Sankey, hiệu suất lò hơi và chiller. `tariff_and_power_quality_analysis` tính chi phí TOU, dịch tải, hệ số phụ tải và cos φ. `energy_baseline` ước tính đường cơ sở OLS/Change-Point, NRA, CUSUM và FSU. |
+| **Cơ hội** | Xem giả định, so sánh phương án và ghi quyết định | `list_opportunities` ước tính điện và tiền tiết kiệm, ROI và hoàn vốn (dùng cơ cấu khung giờ khi cấu hình nhiều đơn giá). SQLite lưu trạng thái đã duyệt hoặc từ chối. |
+| **Báo cáo** | Xem phạm vi và tải hồ sơ phân tích | `report.py` tạo DOCX, Markdown và JSON kèm thông tin về tệp nguồn, giả định, quyết định và mã lần chạy. Hồ sơ đưa vào kết quả đường cơ sở, cân bằng GJ/TOE và TOU/chất lượng điện nếu phiên đã tính. |
+| **Hỏi đáp** | Đặt câu hỏi hoặc mở diễn giải từ một kết quả phân tích | `agent.ask` dùng kết quả đã tính của phiên. `verification.verify_results` đối chiếu số theo trích dẫn và tự động sửa tối đa hai lượt trên bằng chứng SQLite trước khi gắn huy hiệu kiểm chứng. |
 
 ## Cách đọc kết quả
 

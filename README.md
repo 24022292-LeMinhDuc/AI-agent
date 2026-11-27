@@ -6,7 +6,7 @@
 
 ## Cài đặt và chạy bằng một lệnh
 
-Cần Python 3.12 trở lên và PowerShell. `run.ps1` tạo `.venv` khi cần, cài các phiên bản thư viện trong `requirements.txt` và khởi chạy Streamlit tại `pi`.
+Cần Python 3.12 trở lên và PowerShell. `run.ps1` tạo `.venv` khi cần, cài các phiên bản thư viện trong `requirements.txt` và khởi chạy Streamlit tại `http://127.0.0.1:8501` theo mặc định.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
@@ -35,25 +35,9 @@ Dashboard lấy nhiệt độ và độ ẩm hiện tại từ mô hình Open-Me
 
 Nhiệt độ trong tệp tải lên là nguồn của biểu đồ lịch sử, CDD, EnPI và đường cơ sở. Endpoint công khai của Open-Meteo dùng cho mục đích phi thương mại. [Điều khoản Open-Meteo](https://open-meteo.com/en/terms)
 
-## Cấu trúc thư mục
+## Mã nguồn và tài liệu
 
-- `run.ps1`: khởi tạo/cập nhật môi trường và chạy ứng dụng bằng một lệnh.
-- `.env.example`: mẫu khai báo API key; bản `.env` thực tế không được đưa vào Git.
-- `app.py` — giao diện Streamlit và điều hướng của ứng dụng.
-- `agent.py`, `schemas.py`: vòng lặp hỏi đáp, kiểm tra schema và điều phối công cụ.
-- `gemini_service.py`: cấu hình model, thời gian chờ và xử lý lỗi Gemini dùng chung.
-- `weather_api.py`, `weather_panel.py`: lấy thời tiết theo giờ và hiển thị trong Dashboard.
-- `mapping.py`: đề xuất mapping, cảnh báo đơn vị và chuẩn hóa cột.
-- `tools.py`: các phép tính tất định cho làm sạch, SEU, EnPI, so sánh và cơ hội.
-- `energy_baseline.py` — khớp đường cơ sở theo ngày, chuẩn hóa theo điều kiện kỳ báo cáo và tính chỉ số độ phù hợp.
-- `db.py`: lưu lịch sử chạy công cụ và quyết định Approve/Reject trong SQLite.
-- `report.py`: tổng hợp hồ sơ và xuất Markdown, DOCX hoặc JSON.
-- `config.yaml`: các giả định cấu hình; cần kiểm chứng trước khi áp dụng thực tế.
-- `data/`: ba bộ CSV mẫu và `make_sample.py` để tạo dữ liệu giả lập.
-- `tests/`: unit tests và acceptance tests.
-- `scripts/verify_numbers.py`: đối chiếu số trong câu trả lời với kết quả công cụ theo `run_id`.
-- `docs/`: tài liệu dự án.
-- `runs.db`: cơ sở dữ liệu SQLite được tạo khi ghi lần chạy hoặc quyết định đầu tiên.
+`app.py` là điểm vào giao diện. `config.yaml` chứa các giả định phân tích và cấu hình vị trí thời tiết. `data/` chứa bộ mẫu, `tests/` chứa kiểm thử, còn `runs.db` lưu lịch sử tính toán và quyết định trên máy. [Kiến trúc và danh mục công cụ](docs/bao-cao-he-thong.md)
 
 ## Demo trong 5 phút
 
@@ -81,6 +65,8 @@ Giá 2.500 VNĐ/kWh, hệ số điện 0,65 kgCO₂e/kWh và hệ số dầu DO 
 Tạo lại ba tệp bằng `.\.venv\Scripts\python.exe data\make_sample.py`.
 
 ## Kiểm chứng câu trả lời
+
+Câu trả lời có số liệu từ công cụ được đối chiếu với các run của lượt hỏi đáp trong phiên hiện tại. Khi số hoặc nguồn chưa khớp, Gemini có tối đa hai lượt viết lại bằng văn bản. Huy hiệu dưới câu trả lời cho biết kết quả đối chiếu. Cảnh báo liệt kê số chưa khớp, số thiếu trích dẫn và mã nguồn không hợp lệ.
 
 Có thể truyền trực tiếp câu trả lời có trích dẫn `[run_id: 12]` hoặc đọc từ tệp.
 

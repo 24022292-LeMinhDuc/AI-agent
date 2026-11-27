@@ -17,9 +17,9 @@ from streamlit.testing.v1 import AppTest
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
-import db
-import mapping
-import tools
+import db  # noqa: E402
+import mapping  # noqa: E402
+import tools  # noqa: E402
 
 
 def _timed(phases: dict[str, float], name: str, action: Callable[[], Any]) -> Any:

@@ -197,3 +197,65 @@ def test_generate_interpretation_uses_gemini_without_adding_numbers(
     })
 
     assert result == expected_text
+
+
+def test_report_includes_energy_balance_and_tariff_when_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Hồ sơ xuất kèm cân bằng GJ/TOE và TOU khi phiên đã tính hai công cụ này."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2025-04-01 08:00", periods=3, freq="h"),
+            "tariff_period": ["peak", "normal", "off_peak"],
+            "kwh_total": [100.0, 80.0, 60.0],
+            "kwh_chiller": [60.0, 48.0, 36.0],
+            "cooling_load_rth": [100.0, 80.0, 60.0],
+            "boiler_fuel_kg": [100.0, 50.0, 50.0],
+            "fuel_type": ["DO", "Biomass", "Biomass"],
+            "steam_t": [1.0, 0.2, None],
+            "peak_demand_kw": [120.0, 100.0, 80.0],
+            "power_factor": [0.8, 0.9, 0.95],
+            "production_t": [10.0, 9.0, 8.0],
+            "temp_c": [30.0, 29.0, 27.0],
+            "cdd": [6.0, 5.0, 3.0],
+        }
+    )
+    store = {
+        "filename": "audit.csv",
+        "mapping_confirmed": True,
+        "df": df,
+        "measured_df": df.copy(),
+        "run_scope_id": "scope-balance-tariff",
+        "decision_scope_id": "scope-balance-tariff",
+        "config": {
+            "seu_threshold": 0.8,
+            "tariff_vnd_per_kwh": {"peak": 3151, "normal": 1738, "off_peak": 1146},
+            "fuel_properties": {
+                "do_oil": {"ncv_gj_per_kg": 0.043, "co2_kg_per_gj": 74.1},
+                "biomass": {"ncv_gj_per_kg": 0.0156, "co2_kg_per_gj": 112.0},
+            },
+            "opportunities": [],
+        },
+    }
+    balance_resp = run_tool("energy_balance", {}, store)
+    tariff_resp = run_tool("tariff_power_quality", {}, store)
+    store["analysis_results"] = {
+        "energy_balance": balance_resp,
+        "tariff_power_quality": tariff_resp,
+    }
+
+    report_data = build_report_data(store)
+    assert report_data["energy_balance"]["run_id"] == balance_resp["run_id"]
+    assert report_data["tariff_power_quality"]["run_id"] == tariff_resp["run_id"]
+    assert balance_resp["run_id"] in report_data["run_ids"]
+    assert tariff_resp["run_id"] in report_data["run_ids"]
+
+    markdown = render_markdown(report_data, FIXED_INTERPRETATION)
+    assert "Cân bằng năng lượng (GJ/TOE) và hiệu suất" in markdown
+    assert "Biểu giá TOU và chất lượng điện" in markdown
+    assert "Chi phí TOU ước tính" in markdown
+
+    docx_bytes = render_docx(report_data, FIXED_INTERPRETATION)
+    assert len(docx_bytes) > 0

@@ -102,7 +102,7 @@ def _connect() -> sqlite3.Connection:
 def log_run(tool: str, args: dict[str, Any], result: Any, *, scope_id: str = "") -> int:
     """Ghi một lần chạy theo phạm vi và trả về mã run_id."""
     args_json = json.dumps(_json_safe(args), ensure_ascii=False, allow_nan=False)
-    result_json = json.dumps(_json_safe(result), ensure_ascii=False, allow_nan=False)
+    result_json = json.dumps(_json_safe(result), ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     with closing(_connect()) as connection, connection:
         cursor = connection.execute(
             "INSERT INTO runs (ts, tool, args_json, result_json, scope_id) VALUES (?, ?, ?, ?, ?)",

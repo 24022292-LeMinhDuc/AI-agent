@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import os
+import sqlite3
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
@@ -22,7 +23,7 @@ from plotly.subplots import make_subplots
 
 import db
 from agent import ask, run_tool
-from energy_baseline import BASELINE_DRIVER_LABELS
+from energy_baseline import BASELINE_DRIVER_LABELS, BASELINE_MODEL_TYPES, DEFAULT_HDD_BASE_TEMP_C
 from mapping import (
     CANONICAL_COLUMNS,
     apply_mapping,
@@ -538,9 +539,14 @@ def _show_dashboard(store: dict[str, Any]) -> None:
                 column.metric(label, value, border=True)
     cost = summary.get("estimated_cost_vnd")
     if cost is not None:
+        price_label = (
+            "đơn giá TOU bình quân gia quyền theo kWh"
+            if isinstance(store["config"].get("tariff_vnd_per_kwh"), dict)
+            else "đơn giá giả định"
+        )
         st.caption(
-            f"Chi phí ước tính **{_format_value(cost, 0)} VNĐ** theo giá điện giả định "
-            f"{_format_value(summary.get('tariff_vnd_per_kwh'), 0)} VNĐ/kWh."
+            f"Chi phí ước tính **{_format_value(cost, 0)} VNĐ** · "
+            f"{price_label} {_format_value(summary.get('tariff_vnd_per_kwh'), 0)} VNĐ/kWh."
         )
     st.caption(
         f"Khoảng {start_date:%Y-%m-%d} đến {end_date:%Y-%m-%d} · "
@@ -710,10 +716,147 @@ def _show_dashboard(store: dict[str, Any]) -> None:
 
 
 def _show_seu_enpi(store: dict[str, Any]) -> None:
-    """Hiển thị Pareto SEU và kết quả EnPI."""
+    """Hiển thị phân tích điện, cân bằng năng lượng và chất lượng điện."""
     if not _show_mapping_guide(store):
         return
 
+    balance_title = "Cân bằng Đa năng lượng"
+    tariff_title = "Biểu giá TOU & Chất lượng điện"
+    electrical, balance, tariff = st.tabs(["SEU & EnPI điện", balance_title, tariff_title])
+    with electrical:
+        _show_electric_seu_enpi(store)
+    with balance:
+        _show_audit_tool(store, "energy_balance", balance_title, _show_energy_balance,
+                         "Giải thích cân bằng GJ, các SEU và hiệu suất lò hơi, chiller từ số đo ghép cặp.")
+    with tariff:
+        _show_audit_tool(store, "tariff_power_quality", tariff_title, _show_tariff_power_quality,
+                         "Giải thích phân bổ chi phí TOU, khả năng dịch tải, hệ số phụ tải và cos φ của kỳ đo.")
+
+
+def _show_audit_tool(
+    store: dict[str, Any], tool: str, title: str, render: Callable[[dict], None], question: str,
+) -> None:
+    source = store.get("measured_df", store["df"])
+    config_key = json.dumps(store["config"], sort_keys=True, ensure_ascii=False)
+    key = (tool, store["run_scope_id"], id(source), config_key)
+    response = _session_cached(store, key, lambda: run_tool(tool, {}, store))
+    result = response.get("result", {})
+    if error := response.get("error") or result.get("error"):
+        st.error(error)
+        return
+    run_id = response["run_id"]
+    store.setdefault("analysis_results", {})[tool] = response
+    st.caption(f"Toàn bộ dữ liệu đã xác nhận · run_id {run_id}")
+    _show_interval_quality(result["interval_quality"])
+    for warning in result.get("warnings", []):
+        st.warning(warning)
+    if not result["available"]:
+        st.info(result["reason"])
+        return
+    render(result)
+    for section in result.get("sections", {}).values():
+        if not section["available"] and section.get("reason"):
+            st.caption(section["reason"])
+    if st.button("Hỏi AI về kết quả này", key=f"ask_{tool}_{run_id}"):
+        _handoff_to_chat(store, title, [run_id], question)
+
+
+def _show_energy_balance(result: dict) -> None:
+    labels = {
+        **CATEGORY_LABELS, "electricity": "Điện", "boiler": "Lò hơi",
+        "unallocated_electricity": "Điện chưa phân bổ", "biomass": "Sinh khối",
+        "coal": "Than đá", "do_oil": "Dầu DO", "fo_oil": "Dầu FO", "lpg": "LPG", "cng": "Khí tự nhiên",
+    }
+    energy, boiler, chiller, cop = st.columns(4)
+    energy.metric("Năng lượng đầu vào (GJ)", _format_value(result["total_input_gj"]), border=True)
+    boiler.metric("Hiệu suất lò hơi (%)", _format_value(result["boiler_efficiency_pct"]), border=True)
+    chiller.metric("Chiller (kW/RT)", _format_value(result["chiller_kw_per_rt"], 3), border=True)
+    cop.metric("COP chiller", _format_value(result["chiller_cop"]), border=True)
+    st.caption(
+        f"Đầu vào quy đổi {_format_value(result['total_input_toe'], 3)} TOE · "
+        f"Lò hơi có {result['boiler_paired_rows']} bản ghi ghép cặp · "
+        f"Chiller có {result['chiller_paired_rows']} bản ghi ghép cặp."
+    )
+    if result["chiller_rating"]:
+        st.caption(f"Chiller xếp loại {result['chiller_rating'].lower()} theo ngưỡng tham chiếu kW/RT.")
+    if links := result["sankey_links"]:
+        diagram = go.Figure(go.Sankey(
+            valuesuffix=" GJ", valueformat=",.2f",
+            node={"label": [labels.get(name, name) for name in result["sankey_nodes"]],
+                  "thickness": 16, "pad": 18},
+            link={field: [link[field] for link in links] for field in ("source", "target", "value")},
+        ))
+        diagram.update_layout(title="Phân bổ năng lượng đầu vào", margin=dict(l=12, r=12, t=45, b=12))
+        st.plotly_chart(diagram, width="stretch")
+    if rows := result["seu_breakdown"]:
+        table = pd.DataFrame(rows)
+        table["use"] = table["use"].replace(labels)
+        st.dataframe(table.rename(columns={
+            "use": "Hạng mục", "gj": "GJ", "toe": "TOE", "share_pct": "Tỷ trọng (%)", "is_seu": "SEU",
+        }), width="stretch", hide_index=True)
+    outputs = [
+        {"Đầu ra": label, "GJ": result["outputs"][key]["gj"], "TOE": result["outputs"][key]["toe"]}
+        for key, label in (("steam", "Hơi"), ("cooling", "Lạnh")) if result["outputs"][key]["rows"]
+    ]
+    if outputs:
+        st.dataframe(outputs, width="stretch", hide_index=True)
+
+
+def _show_tariff_power_quality(result: dict) -> None:
+    periods = {"peak": ("Cao điểm", "#b66028"), "normal": ("Bình thường", "#167a75"),
+               "off_peak": ("Thấp điểm", "#6392bb")}
+    cost, share, saving = st.columns(3)
+    cost.metric("Chi phí TOU ước tính (VNĐ)", _format_value(result["estimated_cost_vnd"], 0), border=True)
+    share.metric("Điện giờ cao điểm (%)", _format_value(result["peak_share_pct"]), border=True)
+    saving.metric("Tiết kiệm khi dịch tải (VNĐ)", _format_value(result["shift_savings_vnd"], 0), border=True)
+    st.caption(
+        f"Kịch bản dịch {result['shift_fraction']:.0%} điện cao điểm sang thấp điểm · "
+        f"{result['priced_rows']}/{result['energy_rows']} bản ghi điện có đơn giá."
+    )
+    if result["unclassified_kwh"]:
+        st.warning(f"Có {_format_value(result['unclassified_kwh'])} kWh chưa xác định khung giờ.")
+    profile = pd.DataFrame(result["tou_profile"])
+    if not profile.empty:
+        figure = go.Figure()
+        for period, (label, color) in periods.items():
+            data = profile[profile["period"] == period]
+            if not data.empty:
+                figure.add_bar(x=data["month"], y=data["kwh"], name=label, marker_color=color)
+        figure.update_layout(title="Điện theo tháng và khung giờ", barmode="stack", yaxis_title="kWh",
+                             xaxis_type="category", legend_orientation="h", margin=dict(l=12, r=12, t=45, b=12))
+        st.plotly_chart(figure, width="stretch")
+        table = pd.DataFrame(result["tou"])
+        table["period"] = table["period"].map({key: label for key, (label, _) in periods.items()})
+        st.dataframe(table.rename(columns={
+            "period": "Khung giờ", "rows": "Bản ghi", "kwh": "kWh", "rate_vnd_per_kwh": "VNĐ/kWh",
+            "cost_vnd": "Chi phí ước tính (VNĐ)",
+        }), width="stretch", hide_index=True)
+    if result["reported_cost_vnd"] is not None:
+        st.caption(f"Chi phí năng lượng ghi trong tệp · {_format_value(result['reported_cost_vnd'], 0)} VNĐ")
+
+    peak, factor, pf = st.columns(3)
+    peak.metric("Công suất đỉnh (kW)", _format_value(result["peak_demand_kw"]), border=True)
+    factor.metric("Hệ số phụ tải (Load Factor)", _format_value(result["load_factor"], 3), border=True)
+    pf.metric("cos φ trung bình", _format_value(result["mean_power_factor"], 3), border=True)
+    if result["peak_timestamp"]:
+        st.caption(f"Mốc đo có công suất đỉnh · {pd.Timestamp(result['peak_timestamp']):%d/%m/%Y %H:%M}")
+    if result["demand_charge_vnd_per_kw"] > 0:
+        st.caption(f"Phí công suất ước tính · {_format_value(result['demand_charge_vnd'], 0)} VNĐ")
+    if result["pf_rows"]:
+        st.caption(
+            f"cos φ dưới {result['min_pf']:g} tại {result['low_pf_records']} bản ghi "
+            f"({_format_value(result['low_pf_days'], 0)} ngày) · "
+            f"Tiền phản kháng ước tính {_format_value(result['reactive_penalty_vnd'], 0)} VNĐ · "
+            f"Dung lượng bù sơ bộ {_format_value(result['compensation_kvar'])} kVAr."
+        )
+    if alerts := result["pf_alerts"]:
+        st.dataframe(pd.DataFrame(alerts).rename(columns={
+            "day": "Ngày dưới ngưỡng", "records": "Bản ghi", "min_pf": "cos φ thấp nhất",
+            "compensation_kvar": "Dung lượng bù (kVAr)", "penalty_vnd": "Tiền phản kháng (VNĐ)",
+        }), width="stretch", hide_index=True)
+
+
+def _show_electric_seu_enpi(store: dict[str, Any]) -> None:
     df = store["df"]
     kwh_cols = [column for column in df.columns if str(column).startswith("kwh_")]
     if not kwh_cols:
@@ -883,10 +1026,15 @@ def _show_baseline_result(store: dict[str, Any], response: dict[str, Any]) -> No
     result = response["result"]
     summary = result["summary"]
     model = result["model"]
-    st.caption(f"Nguồn đường cơ sở · run_id {response['run_id']}")
+    st.caption(f"{model['method']} · run_id {response['run_id']}")
+    if (balance := model.get("balance_temp_c")) is not None:
+        if isinstance(balance, dict):
+            st.caption(f"Điểm cân bằng · Sưởi {balance['heating']:g} °C · Làm lạnh {balance['cooling']:g} °C")
+        else:
+            st.caption(f"Nhiệt độ cân bằng {balance:g} °C")
     kwh_metrics = (
         ("Thực đo (kWh)", summary["actual_kwh"]),
-        ("Cơ sở điều chỉnh (kWh)", summary["expected_kwh"]),
+        ("Cơ sở chuẩn hóa (kWh)", summary["expected_kwh"]),
         ("Tiết kiệm ước tính (kWh)", summary["savings_kwh"]),
     )
     for column, (label, value) in zip(st.columns(3), kwh_metrics):
@@ -894,8 +1042,35 @@ def _show_baseline_result(store: dict[str, Any], response: dict[str, Any]) -> No
     if summary["savings_pct"] is not None:
         st.caption(
             f"Tỷ lệ tiết kiệm ước tính {_format_value(summary['savings_pct'])}% so với "
-            "đường cơ sở điều chỉnh. Giá trị âm là mức sử dụng điện tăng."
+            "đường cơ sở sau NRA. Giá trị âm là mức sử dụng điện tăng."
         )
+    check = result.get("ashrae14_check")
+    uncertainty = result.get("uncertainty", {})
+    if check:
+        left, middle, right = st.columns(3)
+        status = "Đạt" if check["passed"] else "Không đạt"
+        color = "green" if check["passed"] else "red"
+        period_label = "ngày" if check["granularity"] == "daily" else "tháng"
+        left.badge(f"ASHRAE 14 · {status} theo {period_label}", color=color)
+        fsu = uncertainty.get("fsu_90_pct")
+        middle.metric("FSU (90%)", f"{_format_value(fsu)}%" if fsu is not None else "—", border=True)
+        if fsu is not None:
+            middle.caption(
+                "Đạt tiêu chí độ bất định của dự án" if result["statistically_significant_savings"]
+                else "Chưa đạt tiêu chí độ bất định của dự án"
+            )
+        right.metric("Điều chỉnh NRA (kWh)", _format_value(result["nra_total_kwh"]), border=True)
+        st.caption(
+            f"Ngưỡng mô hình của dự án · CV(RMSE) ≤ {check['max_cv_rmse_pct']:g}% · "
+            f"|NMBE| ≤ {check['max_abs_nmbe_pct']:g}% · {check['observations']} quan sát. "
+            "FSU được tính từ phần dư theo ngày."
+        )
+        if interval := uncertainty.get("confidence_interval_kwh"):
+            confidence = uncertainty["confidence_level"] * 100
+            st.caption(
+                f"Khoảng ước lượng tiết kiệm {confidence:g}% · "
+                f"{_format_value(interval['lower'])} đến {_format_value(interval['upper'])} kWh"
+            )
     for warning in result["warnings"]:
         st.warning(warning)
     for assumption in result["assumptions"]:
@@ -922,7 +1097,7 @@ def _show_baseline_result(store: dict[str, Any], response: dict[str, Any]) -> No
         figure = go.Figure()
         for key, label, color in (
             ("actual_kwh", "Thực đo", "#138676"),
-            ("expected_kwh", "Cơ sở điều chỉnh", "#5590b3"),
+            ("expected_kwh", "Cơ sở chuẩn hóa", "#5590b3"),
         ):
             figure.add_bar(
                 x=[month["month"] for month in monthly],
@@ -944,13 +1119,30 @@ def _show_baseline_result(store: dict[str, Any], response: dict[str, Any]) -> No
         figure.update_yaxes(gridcolor="#e8efed")
         st.plotly_chart(figure, width="stretch")
 
+    if series := result.get("cusum_series"):
+        points = pd.DataFrame(series)
+        figure = go.Figure(go.Scatter(
+            x=points["date"], y=points["cusum_kwh"], customdata=points["daily_diff_kwh"],
+            mode="lines", line={"color": "#138676", "width": 2.5}, name="CUSUM",
+            hovertemplate="%{x|%d/%m/%Y}<br>Tích lũy %{y:,.2f} kWh<br>Trong ngày %{customdata:,.2f} kWh<extra></extra>",
+        ))
+        figure.add_hline(y=0, line_dash="dot", line_color="#83948e")
+        figure.update_layout(
+            title="Chênh lệch tích lũy (CUSUM)", height=295,
+            margin=dict(l=10, r=10, t=55, b=10), xaxis_title="Ngày đủ điều kiện",
+            yaxis_title="Chênh lệch (kWh)", hovermode="x unified",
+        )
+        figure.update_xaxes(type="date")
+        st.plotly_chart(figure, width="stretch")
+        st.caption("CUSUM cộng dồn điện thực đo trừ điện tham chiếu và NRA. Đường giảm biểu thị tiết kiệm.")
+
     with st.container(border=True):
         st.markdown("**Chẩn đoán độ phù hợp mô hình**")
         indicators = (
             ("R²", model["r2"], ""),
             ("R² hiệu chỉnh", model["adjusted_r2"], ""),
-            ("CV(RMSE)", model["cvrmse_pct"], "%"),
-            ("NMBE", model["nmbe_pct"], "%"),
+            ("CV(RMSE)", check["cvrmse_pct"] if check else model["cvrmse_pct"], "%"),
+            ("NMBE", check["nmbe_pct"] if check else model["nmbe_pct"], "%"),
         )
         st.dataframe(
             pd.DataFrame(
@@ -967,21 +1159,35 @@ def _show_baseline_result(store: dict[str, Any], response: dict[str, Any]) -> No
             "Chỉ số độ phù hợp tính trong kỳ cơ sở. NMBE gần 0 với mô hình có hệ số chặn "
             "phản ánh độ lệch trung bình trong mẫu."
         )
-        labels = {"intercept": "Hệ số chặn", **BASELINE_DRIVER_LABELS}
-        ranges = model["driver_ranges"]
+        labels = {
+            "intercept": "Hệ số chặn", "temp_c": "Nhiệt độ ngoài trời",
+            "heating_degree_c": "Sưởi dưới điểm cân bằng", "cooling_degree_c": "Làm lạnh trên điểm cân bằng",
+            **BASELINE_DRIVER_LABELS,
+        }
+        coefficient_rows = result.get("coefficients", [
+            {"feature": name, "coef": coef} for name, coef in model["coefficients"].items()
+        ])
         st.dataframe(
             pd.DataFrame(
                 {
-                    "Thành phần": labels.get(name, name),
-                    "Hệ số": value,
-                    "Nhỏ nhất kỳ cơ sở": ranges.get(name, {}).get("min"),
-                    "Lớn nhất kỳ cơ sở": ranges.get(name, {}).get("max"),
+                    "Thành phần": labels.get(row["feature"], row["feature"]),
+                    "Hệ số": row["coef"],
+                    "Sai số chuẩn": row.get("std_err"),
+                    "p-value": row.get("p_value"),
+                    "VIF": row.get("vif"),
+                    "Có ý nghĩa": row.get("significant"),
                 }
-                for name, value in model["coefficients"].items()
+                for row in coefficient_rows
             ),
             hide_index=True,
             width="stretch",
         )
+        if check and check["vif_warnings"]:
+            flagged = ", ".join(labels.get(name, name) for name in check["vif_warnings"])
+            st.warning(f"VIF vượt ngưỡng tại {flagged}.")
+        if check and check["insignificant_drivers"]:
+            flagged = ", ".join(labels.get(name, name) for name in check["insignificant_drivers"])
+            st.caption(f"Biến chưa đạt ngưỡng p-value · {flagged}.")
 
     if st.button("Hỏi AI về đường cơ sở", key=f"ask_baseline_{response['run_id']}"):
         _handoff_to_chat(
@@ -992,6 +1198,43 @@ def _show_baseline_result(store: dict[str, Any], response: dict[str, Any]) -> No
         )
 
 
+def _edit_baseline_adjustments(scope: str, filters: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Đọc bảng NRA và chuyển ngày, số về các kiểu JSON."""
+    key = f"baseline_nra_{scope}"
+    if key not in st.session_state:
+        filters["nra_seed"] = filters.get("nra_draft", [])
+    fields = ("start_date", "end_date", "delta_kwh_per_day", "reason")
+    table = pd.DataFrame(filters.get("nra_seed", []), columns=fields)
+    for name in fields[:2]:
+        table[name] = pd.to_datetime(table[name])
+    table["delta_kwh_per_day"] = table["delta_kwh_per_day"].astype(float)
+    table["reason"] = table["reason"].astype("string")
+    with st.expander("Điều chỉnh phi thường lệ (NRA)"):
+        st.caption(
+            "Nhập mức kWh/ngày có dấu và lý do thay đổi. Điều chỉnh dương làm tăng điện tham chiếu."
+        )
+        edited = st.data_editor(
+            table, key=key, num_rows="dynamic", hide_index=True, width="stretch",
+            column_config={
+                "start_date": st.column_config.DateColumn("Ngày bắt đầu", required=True),
+                "end_date": st.column_config.DateColumn("Ngày kết thúc", required=True),
+                "delta_kwh_per_day": st.column_config.NumberColumn("Điều chỉnh (kWh/ngày)", required=True),
+                "reason": st.column_config.TextColumn("Lý do", required=True),
+            },
+        ).dropna(how="all")
+        filters["nra_draft"] = edited.to_dict("records")
+        if edited.isna().any(axis=None) or edited["reason"].str.strip().eq("").any():
+            st.warning("Điền đủ hai ngày, mức kWh/ngày và lý do cho mỗi dòng NRA.")
+            return None
+        return [
+            {
+                "start_date": row.start_date.date().isoformat(), "end_date": row.end_date.date().isoformat(),
+                "delta_kwh_per_day": float(row.delta_kwh_per_day), "reason": row.reason.strip(),
+            }
+            for row in edited.itertuples(index=False)
+        ]
+
+
 def _show_energy_baseline(store: dict[str, Any]) -> None:
     """Chọn hai kỳ có thứ tự thời gian và đối chiếu mức điện chuẩn hóa."""
     if not store.get("mapping_confirmed"):
@@ -999,12 +1242,23 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
 
     with st.expander("Đường cơ sở năng lượng (EnB) và tiết kiệm ước tính"):
         df = store.get("measured_df", store["df"])
+        kwh_cols = [column for column in df if column.startswith("kwh_")]
+        if not kwh_cols:
+            st.info("Đường cơ sở điện cần số đo điện năng theo ngày.")
+            return
         drivers = [
             driver for driver in BASELINE_DRIVER_LABELS
             if driver in df and df[driver].nunique() > 1
         ]
-        if not drivers:
-            st.info("Cần biến điều chỉnh có thay đổi theo ngày, chẳng hạn sản lượng, CDD hoặc giờ vận hành.")
+        temperature = pd.to_numeric(df.get("temp_c", pd.Series(dtype=float)), errors="coerce")
+        temperature = temperature[temperature.between(-100, 70)]
+        has_temperature = temperature.nunique() > 1
+        config = store.get("config", {})
+        hdd_base = config.get("hdd_base_temp_c", DEFAULT_HDD_BASE_TEMP_C)
+        if (hdd_base - temperature).clip(lower=0).nunique() > 1 and "hdd" not in drivers:
+            drivers.append("hdd")
+        if not drivers and not has_temperature:
+            st.info("Cần nhiệt độ hoặc biến điều chỉnh thay đổi theo ngày, chẳng hạn sản lượng hay giờ vận hành.")
             return
         first = df["timestamp"].min().date()
         last = df["timestamp"].max().date()
@@ -1018,14 +1272,13 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
         )
         scope = store["run_scope_id"]
         filters = store.setdefault("baseline_filters", {})
-        kwh_cols = [column for column in df if column.startswith("kwh_")]
         mapped_meters = submeter_columns(kwh_cols)
         uses_total_meter = total_meter_columns(df, kwh_cols) == [TOTAL_METER]
         meter_labels = {
             "kwh_total": "Công tơ tổng" if uses_total_meter else "Tổng các phụ tải đã ánh xạ",
             **{meter: CATEGORY_LABELS.get(meter, meter) for meter in mapped_meters},
         }
-        boundary_column, driver_column = st.columns(2)
+        boundary_column, model_column, granularity_column = st.columns(3)
         with boundary_column:
             energy_col = st.selectbox(
                 "Phạm vi điện năng",
@@ -1034,15 +1287,33 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
                 format_func=meter_labels.__getitem__,
                 key=f"baseline_energy_col_{scope}",
             )
-        preferred = [driver for driver in ("production_t", "cdd") if driver in drivers]
-        with driver_column:
-            selection = st.multiselect(
-                "Biến điều chỉnh đường cơ sở",
-                drivers,
-                default=filters.get("drivers", preferred or drivers[:1]),
-                format_func=BASELINE_DRIVER_LABELS.__getitem__,
-                key=f"baseline_drivers_{scope}",
+        models = ("auto", *BASELINE_MODEL_TYPES[:-1])
+        with model_column:
+            model_type = st.selectbox(
+                "Mô hình EnB", models, index=models.index(filters.get("model_type", "ols" if drivers else "auto")),
+                format_func=lambda value: "Tự động" if value == "auto" else value.upper(),
+                key=f"baseline_model_type_{scope}",
             )
+        with granularity_column:
+            granularities = ("daily", "monthly")
+            granularity = st.selectbox(
+                "Đánh giá độ phù hợp", granularities,
+                index=granularities.index(filters.get("granularity", "daily")),
+                format_func={"daily": "Theo ngày", "monthly": "Theo tháng"}.__getitem__,
+                key=f"baseline_granularity_{scope}",
+                help="Theo tháng dùng tổng của các tháng cơ sở đầy đủ. Mô hình vẫn khớp trên số đo ngày.",
+            )
+        if model_type not in ("auto", "ols"):
+            drivers = [driver for driver in drivers if driver not in ("cdd", "hdd")]
+            st.caption("Mô hình Change-Point tự dùng nhiệt độ ngoài trời. Có thể thêm biến vận hành.")
+        preferred = [driver for driver in ("production_t", "cdd") if driver in drivers]
+        selection = st.multiselect(
+            "Biến điều chỉnh đường cơ sở",
+            drivers,
+            default=[driver for driver in filters.get("drivers", preferred or drivers[:1]) if driver in drivers],
+            format_func=BASELINE_DRIVER_LABELS.__getitem__,
+            key=f"baseline_drivers_{scope}",
+        )
         if energy_col == "kwh_total":
             if uses_total_meter:
                 st.caption("Đường cơ sở dùng số đo công tơ tổng tại các ngày đủ biến đã chọn.")
@@ -1070,10 +1341,11 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
                 key=f"reporting_dates_{scope}",
             )
 
-        filters.update(energy_col=energy_col, drivers=selection)
+        adjustments = _edit_baseline_adjustments(scope, filters)
+        filters.update(energy_col=energy_col, drivers=selection, model_type=model_type, granularity=granularity)
         complete_ranges = len(baseline) == len(reporting) == 2
         args = None
-        if complete_ranges:
+        if complete_ranges and adjustments is not None:
             filters.update(baseline=baseline, reporting=reporting)
             args = {
                 "baseline_start": baseline[0].isoformat(),
@@ -1082,12 +1354,17 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
                 "reporting_end": reporting[1].isoformat(),
                 "drivers": list(selection),
                 "energy_col": energy_col,
+                "model_type": model_type,
+                "granularity": granularity,
+                "non_routine_adjustments": adjustments,
             }
         analysis_results = store.setdefault("analysis_results", {})
         if store.get("baseline_args") != args:
             if analysis_results.pop("energy_baseline", None) is not None:
                 store.pop("report_export", None)
             store.pop("baseline_args", None)
+        if adjustments is None:
+            return
         if args is None:
             st.info("Chọn ngày bắt đầu và kết thúc cho cả hai kỳ.")
             return
@@ -1095,12 +1372,15 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
             st.warning("Kỳ cơ sở phải kết thúc trước ngày bắt đầu kỳ báo cáo.")
             return
 
-        if not selection:
+        if not selection and model_type == "ols":
             st.info("Chọn ít nhất một biến điều chỉnh đường cơ sở.")
+            return
+        if not has_temperature and (model_type not in ("auto", "ols") or not selection):
+            st.info("Mô hình đã chọn cần số đo nhiệt độ ngoài trời thay đổi theo ngày.")
             return
 
         if st.button("Tính đường cơ sở", key=f"calculate_baseline_{scope}", type="primary"):
-            cache_key = ("energy_baseline", energy_col, *selection, *baseline, *reporting)
+            cache_key = ("energy_baseline", json.dumps(args, sort_keys=True))
             with st.spinner("Đang điều chỉnh đường cơ sở…"):
                 response = _session_cached(
                     store, cache_key, lambda: run_tool("energy_baseline", args, store)
@@ -1213,7 +1493,11 @@ def _show_run_sources(run_ids: list[int], scope_id: str) -> None:
         if not run_ids:
             st.caption("Câu trả lời này chưa gọi công cụ tính toán.")
             return
-        runs = db.get_runs(run_ids, scope_id=scope_id)
+        try:
+            runs = db.get_runs(run_ids, scope_id=scope_id)
+        except (sqlite3.Error, OSError, ValueError):
+            st.warning("Không đọc được nguồn tính toán từ runs.db.")
+            return
         for run_id in run_ids:
             run = runs.get(int(run_id))
             if run is None:
@@ -1228,12 +1512,33 @@ def _show_run_sources(run_ids: list[int], scope_id: str) -> None:
 
 def _show_answer_evidence(message: dict[str, Any], scope_id: str) -> None:
     """Hiện kết quả đối chiếu số liệu và nguồn trong phạm vi phiên."""
-    verification = message.get("verification")
-    if isinstance(verification, dict) and verification.get("verified") is False:
-        st.warning(
-            "Một số số liệu hoặc run_id trong câu trả lời chưa khớp khi đối chiếu tự động. "
-            "Mở nguồn tính toán để kiểm tra."
-        )
+    check = message.get("verification") or {}
+    status = check.get("status")
+    if status == "verified":
+        st.badge("Đã đối chiếu runs.db", color="green")
+    elif status == "repaired":
+        st.badge("Đã tự hiệu chỉnh & xác thực", color="blue", help=f"Số lượt hiệu chỉnh · {check['retries']}")
+    elif status == "warning" or (status is None and check.get("verified") is False):
+        st.badge("Cảnh báo có số liệu chưa khớp", color="yellow")
+        quantities = [
+            issue["quantity"] + (" · " + ", ".join(f"run_id {i}" for i in issue["run_ids"]) if issue["run_ids"] else "")
+            for issue in check.get("issues", [])
+        ]
+        for label, items in (
+            ("Số chưa khớp", quantities or [item["text"] for item in check.get("unmatched_numbers", [])]),
+            ("Số thiếu trích dẫn", check.get("missing_citations", [])),
+            ("run_id thiếu nguồn hợp lệ", check.get("missing_run_ids", [])),
+        ):
+            if items:
+                st.caption(f"{label} · {', '.join(dict.fromkeys(map(str, items)))}")
+        if detail := check.get("detail"):
+            st.caption(detail)
+    elif status == "not_applicable":
+        st.badge("Không có số liệu cần đối chiếu", color="gray")
+    elif check.get("verified"):
+        st.badge("Đã đối chiếu theo phiên bản trước", color="gray")
+    else:
+        st.badge("Chưa đối chiếu số liệu", color="gray")
     _show_run_sources(message.get("run_ids", []), scope_id)
 
 

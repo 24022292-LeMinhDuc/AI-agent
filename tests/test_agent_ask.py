@@ -428,3 +428,109 @@ def test_dashboard_tool_sends_summary_to_gemini_and_keeps_chart_in_database(
     saved_run = db.get_run(answer["run_ids"][0])
     assert saved_run is not None
     assert "aggregated" in saved_run["result"]
+
+
+def _compare_call() -> SimpleNamespace:
+    return _function_response("compare_periods", {"month_a": "2025-01", "month_b": "2025-02"})
+
+
+def test_verification_accepts_the_first_supported_answer(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    correct = "Điện chiller tăng 60 kWh [run_id: 1]."
+    models = _mock_gemini(monkeypatch, [_compare_call(), _text_response(correct)])
+    reply = agent.ask("Chiller thay đổi bao nhiêu?", _compare_store())
+    assert reply["answer"] == correct
+    assert reply["verification"]["status"] == "verified"
+    assert reply["verification"]["retries"] == 0
+    assert reply["verification"]["missing_citations"] == []
+    assert len(models.calls) == 2
+
+
+@pytest.mark.parametrize(("draft", "problem"), [
+    ("Điện chiller tăng 999 kWh [run_id: 1].", "999"),
+    ("Điện chiller tăng 60 kWh.", "60"),
+])
+def test_verification_repairs_with_feedback_outside_the_tool_budget(tmp_path, monkeypatch, draft, problem) -> None:
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    monkeypatch.setattr(agent, "MAX_TOOL_ROUNDS", 2)
+    monkeypatch.setattr(agent, "MAX_TOOL_CALLS", 1)
+    correct = "Điện chiller tăng 60 kWh [run_id: 1]."
+    models = _mock_gemini(monkeypatch, [_compare_call(), _text_response(draft), _text_response(correct)])
+    reply = agent.ask("Chiller thay đổi bao nhiêu?", _compare_store())
+    assert reply["answer"] == correct
+    assert reply["run_ids"] == [1]
+    assert reply["verification"]["status"] == "repaired"
+    assert reply["verification"]["retries"] == 1
+    assert reply["verification"]["unmatched_numbers"] == []
+    assert len(models.calls) == 3
+    repair = models.calls[-1]
+    assert repair["config"].tools is None
+    feedback = repair["contents"][-1].parts[0].text
+    assert problem in feedback and "[run_id:" in feedback
+    assert db.get_run(2) is None
+
+
+def test_verification_returns_last_answer_and_issues_after_two_retries(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    last = "Chiller tăng 903 kWh [run_id: 1]. Điện tổng tăng 701 kWh."
+    models = _mock_gemini(monkeypatch, [
+        _compare_call(), _text_response("901 kWh [run_id: 1]."),
+        _text_response("902 kWh [run_id: 1]."), _text_response(last),
+    ])
+    reply = agent.ask("So sánh tiêu thụ.", _compare_store())
+    assert reply["answer"] == last
+    check = reply["verification"]
+    assert check["status"] == "warning"
+    assert check["verified"] is False and check["retries"] == 2
+    assert "903" in [item["text"] for item in check["unmatched_numbers"]]
+    assert check["missing_citations"] == ["701"]
+    assert "902" in models.calls[-1]["contents"][-1].parts[0].text
+    assert len(models.calls) == 4 and reply["run_ids"] == [1]
+
+
+def test_verification_uses_persisted_payload_and_never_executes_a_repair_tool_call(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    private = db.log_run("dataset_summary", {}, {"total_kwh": 87654}, scope_id="other")
+    same_scope_old = db.log_run("dataset_summary", {}, {"total_kwh": 76543}, scope_id="active")
+    calls = []
+
+    def simulated_tool(name, args, store):
+        calls.append(name)
+        run_id = db.log_run(name, args, {"total_kwh": 500}, scope_id=store["run_scope_id"])
+        return {"run_id": run_id, "result": {"total_kwh": 999}}
+
+    monkeypatch.setattr(agent, "run_tool", simulated_tool)
+    models = _mock_gemini(monkeypatch, [
+        _function_response("dataset_summary", {}),
+        _text_response(f"999 kWh [run_id: 3]. 87654 kWh [run_id: {private}]. [run_id: {same_scope_old}]"),
+        _function_response("data_quality", {}), _text_response("500 kWh [run_id: 3]."),
+    ])
+    reply = agent.ask("Tổng điện?", {**_compare_store(), "run_scope_id": "active"})
+    assert calls == ["dataset_summary"]
+    assert reply["verification"]["status"] == "repaired"
+    assert reply["verification"]["retries"] == 2 and reply["run_ids"] == [3]
+    feedback = models.calls[2]["contents"][-1].parts[0].text
+    assert "999" in feedback and "500" in feedback
+    assert "76543" not in feedback
+
+
+def test_repair_service_failure_preserves_the_last_checked_draft(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    draft = "Chiller tăng 902 kWh [run_id: 1]."
+    _mock_gemini(monkeypatch, [_compare_call(), _text_response(draft), RuntimeError("offline")])
+    reply = agent.ask("Chiller thay đổi bao nhiêu?", _compare_store())
+    assert reply["answer"] == draft
+    check = reply["verification"]
+    assert check["status"] == "warning" and check["retries"] == 1
+    assert check["issues"] == [{"quantity": "902 kWh", "run_ids": [1]}]
+    assert "gián đoạn" in check["detail"]
+
+
+def test_qualitative_repair_has_no_green_verification_badge(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    _mock_gemini(monkeypatch, [
+        _compare_call(), _text_response("999 kWh [run_id: 1]."), _text_response("Chưa đủ bằng chứng."),
+    ])
+    reply = agent.ask("Chiller thay đổi bao nhiêu?", _compare_store())
+    assert reply["verification"]["status"] == "not_applicable"
+    assert reply["verification"]["retries"] == 1

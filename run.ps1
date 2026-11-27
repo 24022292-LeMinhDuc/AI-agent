@@ -1,4 +1,4 @@
-﻿param(
+param(
     [switch]$SetupOnly
 )
 
@@ -6,6 +6,8 @@ $ErrorActionPreference = "Stop"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $projectRoot = $PSScriptRoot
+$env:STREAMLIT_HOME = Join-Path $projectRoot ".streamlit"
+if (-not (Test-Path -LiteralPath $env:STREAMLIT_HOME)) { New-Item -ItemType Directory -Path $env:STREAMLIT_HOME | Out-Null }
 $venvPath = Join-Path $projectRoot ".venv"
 $pythonPath = Join-Path $venvPath "Scripts\python.exe"
 $requirementsPath = Join-Path $projectRoot "requirements.txt"

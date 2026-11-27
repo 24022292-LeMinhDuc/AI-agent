@@ -152,6 +152,36 @@ def test_opportunity_handoff_carries_saved_run_to_agent(
     assert len(app.session_state["store"]["chat_history"]) == 2
 
 
+def test_chat_displays_verification_badges_and_warning_details(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "mock-key")
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+    store = app.session_state["store"]
+    store["chat_history"] = [
+        {"role": "assistant", "content": status, "verification": {"status": status, "retries": index}}
+        for index, status in enumerate(("verified", "repaired"))
+    ]
+    warning = {
+        "status": "warning", "retries": 2, "unmatched_numbers": [{"text": "987", "matched": False}],
+        "missing_citations": ["251"], "missing_run_ids": [61],
+        "issues": [{"quantity": "987 kWh", "run_ids": [61]}],
+    }
+    monkeypatch.setattr(agent, "ask", lambda *args: {"answer": "Kết quả cần xem lại.", "verification": warning})
+    store["pending_question"] = "Kiểm tra số đo."
+    app.button(key="nav_5_Hỏi đáp").click().run()
+    for _ in range(2):
+        assert not app.exception
+        badges = [element.value for element in app.markdown]
+        assert ":green-badge[Đã đối chiếu runs.db]" in badges
+        assert ":blue-badge[Đã tự hiệu chỉnh & xác thực]" in badges
+        assert ":yellow-badge[Cảnh báo có số liệu chưa khớp]" in badges
+        captions = [element.value for element in app.caption]
+        assert "Số chưa khớp · 987 kWh · run_id 61" in captions
+        assert "Số thiếu trích dẫn · 251" in captions
+        assert "run_id thiếu nguồn hợp lệ · 61" in captions
+        app.run()
+
+
 def test_dashboard_filter_and_period_compare_use_logged_results(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -329,6 +359,47 @@ def test_report_export_tracks_current_opportunity_decisions(monkeypatch, tmp_pat
     revised_record = json.loads(app.session_state["store"]["report_export"]["json"])
     assert revised_record["action_plan"]["approved"] == []
     assert len(revised_record["action_plan"]["rejected"]) == 1
+
+
+def test_baseline_editor_records_nra_and_displays_mv_outputs(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    dates = pd.date_range("2026-01-01", periods=45)
+    temperature = [17 + i % 9 for i in range(len(dates))]
+    measured = pd.DataFrame({
+        "timestamp": dates, "temp_c": temperature,
+        "kwh_total": [100 + 3 * max(temp - 20, 0) - (5 if i >= 30 else 0)
+                      for i, temp in enumerate(temperature)],
+    })
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+    app.file_uploader[0].set_value(("mv.csv", measured.to_csv(index=False).encode(), "text/csv")).run()
+    fingerprint = app.session_state["store"]["upload_fingerprint"]
+    app.button(key=f"confirm_{fingerprint}").click().run()
+    scope = app.session_state["store"]["run_scope_id"]
+    app.button(key="nav_3_SEU & EnPI").click().run()
+    app.selectbox(key=f"baseline_model_type_{scope}").select("3pc").run()
+    app.date_input(key=f"baseline_dates_{scope}").set_value((dates[0].date(), dates[29].date())).run()
+    app.date_input(key=f"reporting_dates_{scope}").set_value((dates[30].date(), dates[-1].date())).run()
+
+    app.session_state[f"baseline_nra_{scope}"] = {
+        "edited_rows": {}, "deleted_rows": [], "added_rows": [{
+            "start_date": "2026-01-31", "end_date": "2026-01-31",
+            "delta_kwh_per_day": 4, "reason": "Bổ sung tải",
+        }],
+    }
+    app.button(key=f"calculate_baseline_{scope}").click().run()
+    assert not app.exception and not app.error
+    response = app.session_state["store"]["analysis_results"]["energy_baseline"]
+    assert response["result"]["model"]["balance_temp_c"] == 20
+    assert response["result"]["nra_total_kwh"] == 4
+    assert response["result"]["summary"]["savings_kwh"] == pytest.approx(79)
+    assert any(metric.label == "FSU (90%)" for metric in app.metric)
+    assert any("CUSUM" in chart.proto.spec for chart in app.get("plotly_chart"))
+    app.button(key="nav_2_Dashboard").click().run()
+    app.button(key="nav_3_SEU & EnPI").click().run()
+    store = app.session_state["store"]
+    assert store["analysis_results"]["energy_baseline"]["run_id"] == response["run_id"]
+    assert store["baseline_args"]["non_routine_adjustments"][0]["delta_kwh_per_day"] == 4
 
 
 def test_energy_baseline_uses_measured_scope_and_clears_stale_result(

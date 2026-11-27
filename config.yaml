@@ -1,8 +1,32 @@
 # Các giá trị cấu hình dưới đây là giả định mẫu, cần được kiểm chứng.
-tariff_vnd_per_kwh: 2500 # GIẢ ĐỊNH - cần kiểm chứng
+tariff_vnd_per_kwh: {peak: 3151, normal: 1738, off_peak: 1146} # VNĐ/kWh, thay theo hợp đồng
+power_factor_penalty: {min_pf: 0.90, demand_charge_vnd_per_kw: 0}
+# IPCC 2006, Vol. 2, bảng 1.2 và 2.2. CO₂ trực tiếp khi đốt, gồm CO₂ sinh học.
+fuel_properties:
+  biomass: {ncv_gj_per_kg: 0.0156, co2_kg_per_gj: 112.0} # gỗ
+  coal: {ncv_gj_per_kg: 0.0258, co2_kg_per_gj: 94.6} # than bitum
+  do_oil: {ncv_gj_per_kg: 0.0430, co2_kg_per_gj: 74.1}
+  fo_oil: {ncv_gj_per_kg: 0.0404, co2_kg_per_gj: 77.4}
+  lpg: {ncv_gj_per_kg: 0.0473, co2_kg_per_gj: 63.1}
+  cng: {ncv_gj_per_kg: 0.0480, co2_kg_per_gj: 56.1}
+default_boiler_fuel: biomass
+steam_enthalpy_gj_per_t: 2.76 # Giả định nhiệt hữu ích mỗi tấn hơi, hiệu chỉnh theo nước cấp
 emission_factor_kg_per_kwh: null # TODO: xác minh hệ số phát thải phù hợp; GIẢ ĐỊNH - cần kiểm chứng
 cdd_base_temp_c: 24 # GIẢ ĐỊNH - cần kiểm chứng
+hdd_base_temp_c: 18 # GIẢ ĐỊNH - xác nhận theo công trình
 seu_threshold: 0.8 # GIẢ ĐỊNH - cần kiểm chứng
+
+# Ngưỡng kiểm tra mô hình của dự án. Ngưỡng ngày do dự án chọn.
+mv_standards:
+  daily:
+    max_cv_rmse_pct: 25.0
+    max_abs_nmbe_pct: 10.0
+  monthly:
+    max_cv_rmse_pct: 15.0
+    max_abs_nmbe_pct: 5.0
+  max_p_value: 0.05
+  max_vif: 5.0
+  confidence_level: 0.90
 
 # Điền tọa độ để theo dõi địa điểm này khi mở Dashboard.
 weather:
@@ -10,16 +34,38 @@ weather:
   latitude: null
   longitude: null
 
+financial_assumptions:
+  discount_rate: 0.10  # 10% discount rate for NPV calculations
+  energy_escalation_rate: 0.03  # Annual energy cost escalation (3%)
+  default_lifetime_years: 10  # Default project lifetime in years
+  default_opex_pct_of_capex: 0.02  # OPEX as % of CAPEX per year
+
 opportunities:
   - name: Tối ưu hệ thống chiller # GIẢ ĐỊNH - cần kiểm chứng
     applies_to: kwh_chiller # GIẢ ĐỊNH - cần kiểm chứng
     saving_pct: 0.10 # GIẢ ĐỊNH - cần kiểm chứng
     capex_vnd: 100000000 # GIẢ ĐỊNH - cần kiểm chứng
+    # Optional financial overrides per opportunity
+    lifetime_years: null
+    annual_opex_vnd: null
+    energy_carrier: null  # "electricity" or "fuel"
   - name: Tối ưu hệ thống khí nén # GIẢ ĐỊNH - cần kiểm chứng
     applies_to: kwh_compressed_air # GIẢ ĐỊNH - cần kiểm chứng
     saving_pct: 0.08 # GIẢ ĐỊNH - cần kiểm chứng
     capex_vnd: 50000000 # GIẢ ĐỊNH - cần kiểm chứng
+    lifetime_years: null
+    annual_opex_vnd: null
+    energy_carrier: null
   - name: Nâng cấp hệ thống chiếu sáng # GIẢ ĐỊNH - cần kiểm chứng
     applies_to: kwh_lighting # GIẢ ĐỊNH - cần kiểm chứng
     saving_pct: 0.12 # GIẢ ĐỊNH - cần kiểm chứng
     capex_vnd: 30000000 # GIẢ ĐỊNH - cần kiểm chứng
+    lifetime_years: null
+    annual_opex_vnd: null
+    energy_carrier: null
+
+ghg_assumptions:
+  default_grid_ef_kgco2e_per_kwh: 0.6592  # Source: IPCC 2022 default for Vietnam grid
+  renewable_electricity_share_pct: 0.0
+  irec_kwh: 0.0
+

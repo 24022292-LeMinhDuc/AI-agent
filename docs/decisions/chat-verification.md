@@ -1,0 +1,6 @@
+# Đối chiếu số trong câu trả lời của trợ lý
+
+- Mỗi lượt dùng các run vừa gọi và các run mà người dùng đã chọn làm ngữ cảnh trong cùng phiên. Trợ lý đọc lại kết quả thành công từ SQLite và áp dụng cùng giới hạn trường dữ liệu đã gửi cho Gemini. Danh sách run được phép dùng do ứng dụng xác định trước khi kiểm tra câu trả lời.
+- Các số trong một câu hoặc một dòng bảng dùng trích dẫn tại đó. Khi có nhiều trích dẫn trong cùng câu, mỗi nhóm số dùng trích dẫn liền sau. Mã dạng `[run_id: 12]` là cú pháp đề nghị. Các dạng cũ như `[12]` và `[run_id=12]` tiếp tục dùng được.
+- Phép đối chiếu làm tròn số nguồn theo độ chính xác được viết, xét đơn vị và phụ tải khi nhận diện được. Với kWh và VNĐ, một dấu phẩy sau nhóm đầu và trước đúng ba chữ số được hiểu là phân nhóm nghìn, ví dụ `1,000 kWh`. Để diễn đạt một kWh có phần thập phân, có thể viết `1.00 kWh`. Việc ghép đúng ý nghĩa chỉ số và kỳ báo cáo trong văn bản tự do vẫn cần đọc nguồn.
+- Mỗi lượt tự sửa nhận câu hỏi, bản trả lời cần sửa, các sai lệch và bằng chứng đã lưu. Hai lượt viết lại có ngân sách riêng và chỉ sinh văn bản. Khi dịch vụ bị gián đoạn, giao diện giữ bản trả lời gần nhất và hiển thị cảnh báo cùng số lượt đã thử. Khi bản sửa chỉ còn diễn giải định tính, giao diện dùng huy hiệu trung tính.

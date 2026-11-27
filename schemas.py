@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from energy_baseline import BASELINE_DRIVERS
+from energy_baseline import BASELINE_DRIVERS, BASELINE_MODEL_TYPES
+from tools import FUEL_TYPES
 
 _DATE_PATTERN = r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
 _METER_PATTERN = r"^kwh_[A-Za-z0-9_]+$"
@@ -15,6 +16,13 @@ _DRIVERS_SCHEMA = {
 }
 
 SCHEMAS: dict[str, dict[str, object]] = {
+    "energy_balance": {
+        "type": "object", "properties": {"fuel_type": {"type": "string", "enum": list(FUEL_TYPES)}},
+        "required": [], "additionalProperties": False,
+    },
+    "tariff_power_quality": {
+        "type": "object", "properties": {}, "required": [], "additionalProperties": False,
+    },
     "dataset_summary": {
         "type": "object",
         "properties": {},
@@ -65,7 +73,24 @@ SCHEMAS: dict[str, dict[str, object]] = {
             "drivers": {
                 **_DRIVERS_SCHEMA,
                 "items": {"type": "string", "enum": list(BASELINE_DRIVERS)},
+                "minItems": 0,
                 "maxItems": len(BASELINE_DRIVERS),
+            },
+            "model_type": {"type": "string", "enum": list(BASELINE_MODEL_TYPES)},
+            "granularity": {"type": "string", "enum": ["daily", "monthly"]},
+            "non_routine_adjustments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "start_date": {"type": "string", "pattern": _DATE_PATTERN},
+                        "end_date": {"type": "string", "pattern": _DATE_PATTERN},
+                        "delta_kwh_per_day": {"type": "number"},
+                        "reason": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["start_date", "end_date", "delta_kwh_per_day", "reason"],
+                    "additionalProperties": False,
+                },
             },
         },
         "required": [
@@ -91,6 +116,17 @@ SCHEMAS: dict[str, dict[str, object]] = {
 }
 
 TOOLS: list[dict[str, object]] = [
+    {
+        "name": "energy_balance",
+        "description": "Cân bằng năng lượng đầu vào theo GJ/TOE, phân tích lò hơi, chiller và SEU toàn bộ dữ liệu. "
+                       "Chỉ ghi đè loại nhiên liệu toàn kỳ khi người dùng yêu cầu.",
+        "input_schema": SCHEMAS["energy_balance"],
+    },
+    {
+        "name": "tariff_power_quality",
+        "description": "Phân tích TOU, dịch tải, đỉnh kW, hệ số phụ tải, cos φ và tiền phạt ước tính toàn bộ dữ liệu.",
+        "input_schema": SCHEMAS["tariff_power_quality"],
+    },
     {
         "name": "dataset_summary",
         "description": "Đọc thống kê và metadata của dataset đã xác nhận, không trả toàn bộ dữ liệu.",
@@ -121,7 +157,9 @@ TOOLS: list[dict[str, object]] = [
         "description": (
             "Lập đường cơ sở điện theo ngày và so sánh điện đo kỳ báo cáo với dự đoán đã chuẩn hóa. "
             "Cần ngày bắt đầu/kết thúc hai kỳ, phạm vi cột điện (kwh_total cho tổng) và biến đã chọn. "
-            "Biến điều chỉnh gồm sản lượng, CDD, giờ vận hành, độ ẩm, diện tích hoặc mức lấp đầy có đơn vị. "
+            "Biến điều chỉnh gồm sản lượng, CDD, HDD, giờ vận hành, độ ẩm, diện tích hoặc mức lấp đầy. "
+            "Mô hình Change-Point tự dùng nhiệt độ và có thể truyền danh sách drivers rỗng. "
+            "Chỉ đưa NRA vào khi người dùng đã nêu khoảng ngày, số kWh/ngày có dấu và lý do. "
             "Chỉ dùng các kỳ đã được người dùng xác định. Chênh lệch là ước tính từ mô hình."
         ),
         "input_schema": SCHEMAS["energy_baseline"],
