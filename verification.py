@@ -5,14 +5,13 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
 
-
 # Giữ các cách trích dẫn cũ của CLI và lịch sử trò chuyện.
 _CITATION = r"(?:\[[ \t]*(?:run_id[ \t]*[:=#]?[ \t]*)?\d{1,19}[ \t]*\]|(?<!\w)run_id[ \t]*[:=#][ \t]*\d{1,19}(?!\d))"
-_CITATIONS = re.compile(rf"{_CITATION}(?:[ \t,]*{_CITATION})*", re.I)
+_CITATIONS = re.compile(rf"{_CITATION}(?:[ \t,]*{_CITATION})*", re.IGNORECASE)
 _NUMBER = re.compile(
     r"(?<!\w)[+−-]?(?:(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?!\d)|\d+)"
     r"(?:[.,]\d+)*|[.,]\d+)(?:[eE][+-]?\d+)?"
@@ -21,19 +20,32 @@ _UNIT = re.compile(
     r"\s*(?:(?P<scale>nghìn|ngàn|triệu|tỷ|tỉ)\s+)?"
     r"(?P<unit>%|(?:vn[đd]|đồng|₫|đ|t\s*co[2₂]e|tấn\s+co[2₂]e|kgco[2₂]e|mwh|kwh|kw|°c)"
     r"(?:\s*/\s*(?:kwh|tấn|m[²2]))?(?!\w))",
-    re.I,
+    re.IGNORECASE,
 )
 _SCALES = {"nghìn": 3, "ngàn": 3, "triệu": 6, "tỷ": 9, "tỉ": 9}
 _DATE = re.compile(r"\d{4}-\d{2}(?:-\d{2})?(?:[T ]\d{2}:\d{2}[:.\d+Z-]*)?")
 _REFERENCE_LABEL = re.compile(
-    r"\b(?:scope\s*[123]|ISO\s+\d{4,5}(?::\d{4})?|ASHRAE\s+(?:Guideline\s+)?14(?:-\d{4})?)\b", re.I
+    r"\b(?:scope\s*[123]|ISO\s+\d{4,5}(?::\d{4})?|ASHRAE\s+(?:Guideline\s+)?14(?:-\d{4})?)\b", re.IGNORECASE
 )
 _METER = re.compile(
     r"\b(?:(?P<chiller>chiller)|(?P<lighting>lighting|chiếu sáng)|"
     r"(?P<compressed_air>compressed air|khí nén)|(?P<production>production|điện sản xuất)|"
     r"(?P<total>total|tổng điện|điện tổng|tổng tiêu thụ)|(?P<other>điện phụ trợ khác|kwh other))\b",
-    re.I,
+    re.IGNORECASE,
 )
+_METRIC = re.compile(
+    r"\b(?:(?P<savings>tiết kiệm|savings?|saved)|(?P<actual>thực đo|thực tế|đo được|measured|actual)"
+    r"|(?P<baseline>đường cơ sở|cơ sở chuẩn hóa|tham chiếu|expected|baseline)"
+    r"|(?P<roi>ROI)|(?P<payback>hoàn vốn|payback))\b", re.IGNORECASE
+)
+_FIELD_METRICS = {
+    "actual_kwh": "actual", "total_kwh": "actual", "metered_total_kwh": "actual",
+    "energy_kwh_by_column": "actual", "expected_kwh": "baseline", "base_kwh_annual": "baseline",
+    "saved_kwh": "savings", "savings_kwh": "savings", "annual_kwh_saved": "savings",
+    "saved_vnd": "savings", "annual_cost_saved_vnd": "savings", "shift_savings_vnd": "savings",
+    "savings_pct": "savings", "saving_pct": "saving_assumption", "annual_co2_saved_t": "savings",
+    "co2_tonnes": "savings", "roi_pct": "roi", "payback_months": "payback",
+}
 
 
 def _citation_ids(text: str) -> list[int]:
@@ -115,6 +127,7 @@ class _Fact:
     value: Decimal
     unit: str
     meter: str | None
+    metric: str | None = None
 
 
 def _source_facts(value: Any, path: tuple[str, ...] = (), explicit_unit: str = "") -> Iterator[_Fact]:
@@ -135,7 +148,8 @@ def _source_facts(value: Any, path: tuple[str, ...] = (), explicit_unit: str = "
         number = Decimal(str(value))
         if number.is_finite():
             meter = _METER.search(" ".join(path).replace("_", " "))
-            yield _Fact(number, explicit_unit or _field_unit(path), meter.lastgroup if meter else None)
+            metric = next((_FIELD_METRICS[key] for key in reversed(path) if key in _FIELD_METRICS), None)
+            yield _Fact(number, explicit_unit or _field_unit(path), meter.lastgroup if meter else None, metric)
     elif isinstance(value, str):
         if _DATE.fullmatch(value):
             for component in re.findall(r"\d+", value):
@@ -149,9 +163,12 @@ def _source_facts(value: Any, path: tuple[str, ...] = (), explicit_unit: str = "
                         yield _Fact(reading * 10**scale if scale else reading, label, None)
 
 
-def _matches(raw: str, unit: str, scale: int, meter: str | None, facts: set[_Fact]) -> bool:
+def _matches(raw: str, unit: str, scale: int, meter: str | None, metric: str | None,
+             facts: set[_Fact]) -> bool:
     readings = tuple(_readings(raw, unit))
     for fact in facts:
+        if metric and fact.metric != metric:
+            continue
         if unit == "kwh" and meter and fact.meter and fact.meter != meter:
             continue
         if unit and fact.unit and unit != fact.unit and not (unit == "%" and fact.unit == "fraction"):
@@ -178,7 +195,7 @@ def _claim_groups(answer: str) -> Iterator[tuple[str, list[int]]]:
     answer = _REFERENCE_LABEL.sub(" ", answer.replace("**", "").replace("`", ""))
     answer = re.sub(r"(?m)^[ \t]*\d+[.)](?=[ \t])", "", answer)
     # Cho phép đặt trích dẫn ngay sau dấu chấm kết câu.
-    answer = re.sub(rf"([.!?])\s+(?={_CITATION})", " ", answer, flags=re.I)
+    answer = re.sub(rf"([.!?])\s+(?={_CITATION})", " ", answer, flags=re.IGNORECASE)
     for sentence in re.split(r"[\n;!?]+|\.(?!\d)(?=\s|$)", answer):
         start = 0
         prefix_ids = []
@@ -204,10 +221,18 @@ def verify_results(answer: str, results: dict[int, Any]) -> dict[str, Any]:
     issues = []
     for claim, ids in _claim_groups(answer):
         facts = set().union(*(sources[run_id] for run_id in ids if run_id in sources))
+        previous_end = 0
         for match in _NUMBER.finditer(claim):
             label, scale, end = _unit_after(claim, match.end())
             meters = list(_METER.finditer(claim, 0, match.start())) if label == "kwh" else []
-            matched = _matches(match[0], label, scale, meters[-1].lastgroup if meters else None, facts)
+            context = claim[previous_end:match.start()]
+            labels = list(_METRIC.finditer(context))
+            after_unit = _METRIC.match(claim[end:].lstrip()) if label else None
+            metric = after_unit.lastgroup if after_unit else (labels[-1].lastgroup if labels else None)
+            if metric == "savings" and label == "%" and re.search(r"giả định|assumed", context, re.IGNORECASE):
+                metric = "saving_assumption"
+            matched = _matches(match[0], label, scale, meters[-1].lastgroup if meters else None, metric, facts)
+            previous_end = end
             checked.append({"text": match[0], "matched": matched})
             if not matched:
                 issues.append({"quantity": claim[match.start():end], "run_ids": ids})

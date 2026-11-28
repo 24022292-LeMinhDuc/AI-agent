@@ -9,8 +9,8 @@ import plotly.subplots
 import pytest
 from streamlit.testing.v1 import AppTest
 
-import db
 import agent
+import db
 import mapping
 import tools
 

@@ -1,6 +1,6 @@
 """Kiểm tra giao thức và chuẩn hóa dữ liệu Open-Meteo bằng phản hồi giả lập."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from json import dumps
 from urllib.error import HTTPError, URLError
@@ -14,7 +14,7 @@ from weather_api import WeatherAPIError, fetch_hourly_weather
 
 def _payload() -> dict:
     # Điểm tại múi giờ đổi giờ mùa hè với hai giờ địa phương cùng là 01:00.
-    before = int(datetime(2026, 11, 1, 5, tzinfo=timezone.utc).timestamp())
+    before = int(datetime(2026, 11, 1, 5, tzinfo=UTC).timestamp())
     after = before + 3600
     return {
         "timezone": "America/New_York",

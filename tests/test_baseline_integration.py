@@ -12,7 +12,6 @@ import db
 from agent import _model_result, run_tool
 from report import build_report_data, render_docx, render_markdown, render_report_json
 
-
 BASELINE_ARGS = {
     "baseline_start": "2026-01-01",
     "baseline_end": "2026-01-06",

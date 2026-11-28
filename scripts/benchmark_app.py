@@ -8,19 +8,15 @@ import sys
 import tempfile
 import time
 import tracemalloc
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import plotly.subplots
 from streamlit.testing.v1 import AppTest
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
-
-import db  # noqa: E402
-import mapping  # noqa: E402
-import tools  # noqa: E402
-
 
 def _timed(phases: dict[str, float], name: str, action: Callable[[], Any]) -> Any:
     """Chạy một bước và lưu thời gian thực thi tính bằng giây."""
@@ -32,6 +28,10 @@ def _timed(phases: dict[str, float], name: str, action: Callable[[], Any]) -> An
 
 def main() -> None:
     """Đo luồng upload, xác nhận, dashboard và SEU/EnPI."""
+    import db
+    import mapping
+    import tools
+
     root = ROOT_DIR
     original_db_path = db.DB_PATH
     original_api_key = os.environ.pop("GEMINI_API_KEY", None)
@@ -75,7 +75,7 @@ def main() -> None:
             app = _timed(
                 phases,
                 "apptest_initial_render",
-                lambda: AppTest.from_file(str(root / "app.py")).run(),
+                lambda: AppTest.from_file(str(root / "app.py"), default_timeout=30).run(),
             )
             sample = root / "data" / "sample_a.csv"
             _timed(

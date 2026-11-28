@@ -14,7 +14,6 @@ if __package__ in (None, ""):
 
 from verification import extract_run_ids, verify_results
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = PROJECT_ROOT / "runs.db"
 

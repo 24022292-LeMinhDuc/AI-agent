@@ -8,9 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from google.genai import types
 import pandas as pd
 import pytest
+from google.genai import types
 
 import agent
 import db

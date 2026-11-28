@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -9,7 +10,7 @@ from math import isfinite
 
 import numpy as np
 import pandas as pd
-
+from scipy.optimize import brentq
 
 REPORTING_TIMEZONE = "Asia/Ho_Chi_Minh"
 TOTAL_METER = "kwh_total"
@@ -295,6 +296,23 @@ def _audit_sections(
     }
 
 
+def _energy_coverage(df: pd.DataFrame, energy: pd.DataFrame) -> dict:
+    """Đếm riêng số đo được giữ, ô nội suy và ô trống trong kỳ đang xem."""
+    filled = df.attrs.get("interpolated_intervals", {})
+    intervals = (reporting_timestamps(df["timestamp"]) if "timestamp" in df
+                 else pd.Series(range(len(df)), index=df.index))
+    coverage = {}
+    for column, valid in energy.notna().items():
+        markers = filled.get(column, ())
+        if markers and "timestamp" in df:
+            markers = pd.to_datetime(markers, format="ISO8601")
+        interpolated = int((intervals.isin(markers) & valid).sum())
+        available = int(valid.sum())
+        coverage[column] = {"measured": available - interpolated, "interpolated": interpolated,
+                            "missing": len(df) - available}
+    return coverage
+
+
 def clean(
     df: pd.DataFrame, kwh_cols: Sequence[str]
 ) -> tuple[pd.DataFrame, dict[str, dict[str, int]]]:
@@ -304,8 +322,10 @@ def clean(
     report: dict[str, dict[str, int]] = {}
     order = pd.RangeIndex(len(clean_df))
     segments = None
+    interval_ids = pd.Series(order)
     if "timestamp" in clean_df.columns:
         dates = reporting_timestamps(clean_df["timestamp"]).reset_index(drop=True)
+        interval_ids = dates
         ordered_dates = dates.dropna().sort_values(kind="stable")
         order = ordered_dates.index
         intervals = ordered_dates.diff()
@@ -315,6 +335,7 @@ def clean(
         else:
             segments = pd.Series(range(len(order)), index=order)
 
+    filled = dict(clean_df.attrs.get("interpolated_intervals", {}))
     for column in kwh_cols:
         raw = clean_df[column]
         values = finite_readings(raw).reset_index(drop=True)
@@ -337,6 +358,11 @@ def clean(
             interpolated = ordered_values.interpolate(limit_area="inside").where(short_gaps)
             values.iloc[order] = ordered_values.fillna(interpolated).to_numpy()
             interpolated_count = int(interpolated.notna().sum())
+            if interpolated_count:
+                newly_filled = interval_ids.loc[interpolated.dropna().index].tolist()
+                if "timestamp" in clean_df:
+                    newly_filled = [stamp.isoformat() for stamp in newly_filled]
+                filled[column] = tuple(dict.fromkeys((*filled.get(column, ()), *newly_filled)))
         clean_df[column] = values.to_numpy()
         report[column] = {
             "removed": int(invalid.sum()),
@@ -344,6 +370,7 @@ def clean(
             "missing": int(values.isna().sum()),
         }
 
+    clean_df.attrs["interpolated_intervals"] = filled
     return clean_df, report
 
 
@@ -577,6 +604,11 @@ def tariff_and_power_quality_analysis(df: pd.DataFrame, config: Mapping) -> dict
                 load_reason = "Công suất trung bình từ kWh vượt đỉnh kW. Kiểm tra đơn vị, khoảng đo và ranh giới điện."
                 warnings.append(load_reason)
 
+    if known.any() and times.notna().all() and times.eq(times.dt.normalize()).all():
+        peak_share = shift = None
+        warnings.append("Dữ liệu chỉ có nhãn giá theo ngày. Chi phí được ước tính theo nhãn; "
+                        "cần kWh theo từng khung giờ để đánh giá tỷ trọng cao điểm và dịch tải.")
+
     policy = config.get("power_factor_penalty", {})
     target = float(policy.get("min_pf", .90))
     demand_rate = float(policy.get("demand_charge_vnd_per_kw", 0))
@@ -662,7 +694,7 @@ def dataset_summary(
     )
 
     return {
-        "rows": int(len(df)),
+        "rows": len(df),
         "columns": [str(column) for column in df.columns],
         "missing_values_by_column": {
             str(column): int(count) for column, count in df.isna().sum().items()
@@ -672,6 +704,7 @@ def dataset_summary(
         "valid_timestamp_rows": len(valid_timestamps),
         "interval_quality": quality,
         "energy_rows_by_column": energy.count().to_dict(),
+        "energy_coverage_by_column": _energy_coverage(observed, energy),
         "energy_kwh_by_column": {
             str(column): float(value) if pd.notna(value) else None
             for column, value in energy_totals.items()
@@ -748,13 +781,14 @@ def dashboard_analysis(
         "summary": {
             "start_date": start.date().isoformat(),
             "end_date": end.date().isoformat(),
-            "rows": int(len(filtered_df)),
+            "rows": len(filtered_df),
             "interval_quality": quality,
             "total_kwh": total_value,
             "total_source": _total_source(total_columns),
             "total_energy_rows": int(_row_energy_total(energy[total_columns]).count()),
             **_audit_sections(filtered_df, energy, audit_df, total_columns, start=start, end=end),
             "energy_rows_by_column": energy.count().to_dict(),
+            "energy_coverage_by_column": _energy_coverage(filtered_df, energy),
             "energy_kwh_by_column": {
                 str(column): float(value) if pd.notna(value) else None
                 for column, value in category_totals.items()
@@ -1014,154 +1048,126 @@ def opportunity(
 
 
 
-def evaluate_ecm_financials(opportunity: dict, financial_assumptions: dict, ghg_assumptions: dict) -> dict:
-    """Tính toán toàn bộ chỉ số tài chính và GHG cho một cơ hội ECM.
+def _cash_flow_irr(cash_flows: list[float]) -> float | None:
+    """Tìm IRR duy nhất của dòng tiền đầu tư có đúng một lần đổi dấu."""
+    nonzero = [flow for flow in cash_flows if flow]
+    if not nonzero or cash_flows[0] >= 0 or nonzero[-1] <= 0:
+        return None
+    if any(left > 0 > right for left, right in itertools.pairwise(nonzero)):
+        return None
+    # Tìm nghiệm trên (0, 1] bằng hệ số chiết khấu hoặc hệ số tăng trưởng.
+    # Hai dạng đa thức tương đương tránh chia cho (1+r)^n khi r gần -1.
+    positive_rate = sum(cash_flows) > 0
+    last_payment = max(i for i, flow in enumerate(cash_flows) if flow)
+    payments = cash_flows[:last_payment + 1]
+    coefficients = payments if positive_rate else payments[::-1]
+    root = brentq(np.polynomial.polynomial.polyval, 0.0, 1.0, args=(coefficients,),
+                  xtol=np.finfo(float).tiny, maxiter=1024)
+    return (1 / root if positive_rate else root) - 1
 
-    Parameters
-    ----------
-    opportunity: dict
-        Dữ liệu cơ hội (saving_pct, capex_vnd, applies_to, …).
-    financial_assumptions: dict
-        Các giả định tài chính toàn cục (discount_rate, energy_escalation_rate, …).
-    ghg_assumptions: dict
-        Giả định GHG (default_grid_ef_kgco2e_per_kwh, renewable_electricity_share_pct, irec_kwh).
 
-    Returns
-    -------
-    dict
-        Đối tượng cơ hội đã bổ sung:
-        - annual_kwh_saved, annual_cost_saved_vnd, annual_co2_saved_t
-        - simple_payback_years, discounted_payback_years, npv_vnd, irr_pct, sir, mac_vnd_per_tco2e
-        - ghg_scope1_tco2e, ghg_scope2_location_tco2e, ghg_scope2_market_tco2e, total_emissions_tco2e
-    """
-    # ------------------------------------------------------------------
-    # 1️⃣ Annualisation (kWh saved) – dựa trên dữ liệu năm (đơn vị kWh)
-    # ------------------------------------------------------------------
-    coverage_days = opportunity.get("coverage_days", 365)  # giả sử có trường này, nếu không thì dùng 365
-    total_kwh = opportunity.get("annual_kwh", None)
-    if total_kwh is None:
-        # Nếu không có dữ liệu đầy đủ, dùng saving_pct * kwh_total hiện có (được truyền từ UI)
-        total_kwh = opportunity.get("kwh_total", 0) * opportunity.get("saving_pct", 0)
-    if coverage_days >= 330:
-        annual_kwh_saved = total_kwh
-        annualization_method = "direct"
-    else:
-        # extrapolate
-        daily_avg = total_kwh / coverage_days if coverage_days else 0
-        annual_kwh_saved = daily_avg * 365
-        annualization_method = "extrapolated_warning"
-    # ------------------------------------------------------------------
-    # 2️⃣ Energy cost & CO₂ saved (sử dụng giả định giá năng lượng)
-    # ------------------------------------------------------------------
-    tariff = opportunity.get("tariff_vnd_per_kwh", 0)
-    annual_cost_saved = annual_kwh_saved * tariff
-    # cỡ CO₂ tiết kiệm = kWh_saved * grid emission factor (kgCO2e/kWh) -> tCO2e
-    grid_ef = ghg_assumptions.get("default_grid_ef_kgco2e_per_kwh", 0.6592)
-    annual_co2_saved = annual_kwh_saved * grid_ef / 1000  # tCO2e
-    # ------------------------------------------------------------------
-    # 3️⃣ Cash‑flow projection (CAPEX, OPEX, savings) trong thời gian lifetime
-    # ------------------------------------------------------------------
-    lifetime = opportunity.get("lifetime_years") or financial_assumptions.get("default_lifetime_years", 10)
-    discount_rate = financial_assumptions.get("discount_rate", 0.10)
-    energy_escal = financial_assumptions.get("energy_escalation_rate", 0.03)
+def evaluate_ecm_financials(
+    opportunity: dict, financial_assumptions: dict, ghg_assumptions: dict, *,
+    fuel_properties: Mapping | None = None,
+) -> dict:
+    """Ước tính dòng tiền và phát thải. annual_kwh là điện tiết kiệm đã quy năm."""
+    lifetime = opportunity.get("lifetime_years")
+    if lifetime is None:
+        lifetime = financial_assumptions.get("default_lifetime_years", 10)
+    if type(lifetime) is not int or lifetime < 1:
+        raise ValueError("Tuổi thọ phải là số năm nguyên dương.")
+    discount = financial_assumptions.get("discount_rate", 0.10)
+    escalation = financial_assumptions.get("energy_escalation_rate", 0.03)
+    if any(not isfinite(rate) or rate <= -1 for rate in (discount, escalation)):
+        raise ValueError("Tỷ lệ chiết khấu và tăng giá phải hữu hạn và lớn hơn -100%.")
+
+    kwh = opportunity.get("kwh_total", 0)
+    fraction = opportunity.get("saving_pct", 0)
+    annual_kwh = opportunity.get("annual_kwh")
+    method = "direct"
+    if not 0 <= fraction <= 1:
+        raise ValueError("Tỷ lệ tiết kiệm phải từ 0 đến 1.")
+    if annual_kwh is None:
+        days = opportunity.get("coverage_days", 365)
+        if not isfinite(days) or days <= 0:
+            raise ValueError("Cần số ngày có số đo dương để quy đổi năm.")
+        annual_kwh = kwh * fraction
+        if days < 330:
+            annual_kwh *= 365 / days
+            method = "extrapolated_warning"
+
+    price = opportunity.get("tariff_vnd_per_kwh", 0)
     capex = opportunity.get("capex_vnd", 0)
-    # OPEX có thể được ghi đè per‑opportunity, nếu không thì % của CAPEX
-    annual_opex = opportunity.get("annual_opex_vnd")
-    if annual_opex is None:
-        annual_opex = capex * financial_assumptions.get("default_opex_pct_of_capex", 0.02)
-    # Cash‑flow list (năm 0 là CAPEX, các năm 1..lifetime là net savings)
-    cash_flows = [-capex]
-    for year in range(1, int(lifetime) + 1):
-        # Escalate energy cost savings each year
-        escalated_saving = annual_cost_saved * ((1 + energy_escal) ** (year - 1))
-        net = escalated_saving - annual_opex
-        cash_flows.append(net)
-    # ------------------------------------------------------------------
-    # 4️⃣ Tính NPV, IRR, Discounted Payback, SIR, MAC
-    # ------------------------------------------------------------------
-    npv = sum(cf / ((1 + discount_rate) ** i) for i, cf in enumerate(cash_flows))
-    # IRR via bisection on discount rate r where NPV(r)=0
-    def npv_at(r):
-        return sum(cf / ((1 + r) ** i) for i, cf in enumerate(cash_flows))
-    irr = None
-    # kiểm tra có dấu chuyển đổi không
-    if cash_flows[0] < 0 and any(cf > 0 for cf in cash_flows[1:]):
-        low, high = -0.99, 1.0  # r trong (-0.99, 1)
-        for _ in range(60):  # đủ độ chính xác 2**-60 ~ 1e-18
-            mid = (low + high) / 2
-            val = npv_at(mid)
-            if val > 0:
-                low = mid
-            else:
-                high = mid
-        irr = (low + high) / 2
-    # Simple payback (không chiết khấu)
-    cumulative = -capex
-    simple_payback = None
-    for i, cf in enumerate(cash_flows[1:], start=1):
-        cumulative += cf
-        if cumulative >= 0:
-            simple_payback = i
-            break
-    # Discounted payback
-    cumulative_disc = -capex
-    discounted_payback = None
-    for i, cf in enumerate(cash_flows[1:], start=1):
-        cumulative_disc += cf / ((1 + discount_rate) ** i)
-        if cumulative_disc >= 0:
-            discounted_payback = i
-            break
-    # SIR = (PV of benefits) / (PV of costs) = (NPV + CAPEX) / CAPEX
-    sir = (npv + capex) / capex if capex != 0 else None
-    # MAC = (CAPEX - NPV) / total CO2 saved (tCO2e)
-    mac = (capex - npv) / annual_co2_saved if annual_co2_saved != 0 else None
-    # ------------------------------------------------------------------
-    # 5️⃣ GHG Scope calculations (sử dụng dữ liệu nguyên liệu, kWh)
-    # ------------------------------------------------------------------
-    # Scope 1: dựa trên boiler_fuel_kg * fuel_ef (được truyền trong opportunity)
-    fuel_kg = opportunity.get("boiler_fuel_kg", 0)
-    fuel_type = opportunity.get("energy_carrier") or "electricity"
-    fuel_ef = 0.0
-    # Nếu fuel_type là electricity, không có Scope 1; nếu là fuel, lấy từ mapping trong mapping.py
-    if fuel_type != "electricity":
-        from mapping import fuel_properties
-        ef = fuel_properties.get(fuel_type, {}).get("co2_kg_per_gj", 0)
-        ncv = fuel_properties.get(fuel_type, {}).get("ncv_gj_per_kg", 0)
-        fuel_ef = ef * ncv  # kgCO2e per kg fuel
-    scope1 = fuel_kg * fuel_ef / 1000  # tCO2e
-    # Scope 2 location‑based
-    total_kwh_used = opportunity.get("kwh_total", 0)
-    scope2_loc = total_kwh_used * grid_ef / 1000  # tCO2e
-    # Scope 2 market‑based – áp dụng renewable share và I‑REC
-    renewable_share = ghg_assumptions.get("renewable_electricity_share_pct", 0.0) / 100
-    irec_kwh = ghg_assumptions.get("irec_kwh", 0.0)
-    # Điện tái tạo được trừ khỏi grid factor
-    market_factor = grid_ef * (1 - renewable_share)
-    scope2_mkt = (total_kwh_used - irec_kwh) * market_factor / 1000
-    total_emissions = scope1 + scope2_loc + scope2_mkt
-    # ------------------------------------------------------------------
-    # 6️⃣ Đóng gói kết quả
-    # ------------------------------------------------------------------
-    result = {
-        "annual_kwh_saved": annual_kwh_saved,
-        "annual_cost_saved_vnd": annual_cost_saved,
-        "annual_co2_saved_t": annual_co2_saved,
-        "annualization_method": annualization_method,
-        "simple_payback_years": simple_payback,
-        "discounted_payback_years": discounted_payback,
-        "npv_vnd": npv,
-        "irr_pct": irr * 100 if irr is not None else None,
-        "sir": sir,
-        "mac_vnd_per_tco2e": mac,
-        # GHG
-        "ghg_scope1_tco2e": scope1,
-        "ghg_scope2_location_tco2e": scope2_loc,
-        "ghg_scope2_market_tco2e": scope2_mkt,
-        "total_emissions_tco2e": total_emissions,
-    }
-    return {**opportunity, **result}
+    opex = opportunity.get("annual_opex_vnd")
+    if opex is None:
+        opex = capex * financial_assumptions.get("default_opex_pct_of_capex", 0.02)
+    mass = opportunity.get("boiler_fuel_kg", 0)
+    irec = ghg_assumptions.get("irec_kwh", 0)
+    if any(not isfinite(x) or x < 0 for x in (kwh, annual_kwh, price, capex, opex, mass, irec)):
+        raise ValueError("Điện, nhiên liệu, giá và chi phí phải hữu hạn và không âm.")
+    renewable = ghg_assumptions.get("renewable_electricity_share_pct", 0) / 100
+    if not 0 <= renewable <= 1:
+        raise ValueError("Tỷ lệ điện tái tạo phải từ 0 đến 100%.")
+    grid = ghg_assumptions.get("default_grid_ef_kgco2e_per_kwh")
+    if grid is not None and (not isfinite(grid) or grid < 0):
+        raise ValueError("Hệ số phát thải lưới phải hữu hạn và không âm.")
 
-def calculate_sample_opportunities(
+    carrier = opportunity.get("energy_carrier") or "electricity"
+    fuel = opportunity.get("fuel_type") or (carrier if carrier != "electricity" else None)
+    scope1 = biogenic = 0.0
+    avoided_factor = grid
+    if mass or carrier != "electricity":
+        name = _FUEL_NAMES.get(normalize_label(fuel))
+        properties = (fuel_properties or ghg_assumptions.get("fuel_properties", {})).get(name, {})
+        ncv, co2 = properties.get("ncv_gj_per_kg"), properties.get("co2_kg_per_gj")
+        if ncv is None or co2 is None or not isfinite(ncv) or not isfinite(co2) or ncv <= 0 or co2 < 0:
+            raise ValueError("Cần fuel_type, nhiệt trị và hệ số CO₂ trong fuel_properties cho nhiên liệu.")
+        combustion = mass * ncv * co2 / 1000
+        if name == "biomass":
+            biogenic = combustion
+        else:
+            scope1 = combustion
+        if carrier != "electricity":
+            avoided_factor = 0.0 if name == "biomass" else co2 * GJ_PER_KWH
+    avoided = annual_kwh * avoided_factor / 1000 if avoided_factor is not None else None
+    residual_kwh = max(0.0, kwh * (1 - renewable) - irec)
+    scope2_loc = kwh * grid / 1000 if grid is not None else (None if kwh else 0.0)
+    scope2_mkt = residual_kwh * grid / 1000 if grid is not None else (None if residual_kwh else 0.0)
+
+    annual_savings = annual_kwh * price
+    cash_flows = [-capex]
+    cumulative = discounted = -capex
+    simple_payback = discounted_payback = None
+    pv_benefits = 0.0
+    pv_costs = capex
+    for year in range(1, lifetime + 1):
+        benefit = annual_savings * (1 + escalation) ** (year - 1)
+        factor = (1 + discount) ** -year
+        net = benefit - opex
+        cash_flows.append(net)
+        pv_benefits += benefit * factor
+        pv_costs += opex * factor
+        cumulative += net
+        discounted += net * factor
+        if simple_payback is None and cumulative >= 0:
+            simple_payback = year
+        if discounted_payback is None and discounted >= 0:
+            discounted_payback = year
+    npv = pv_benefits - pv_costs
+    irr = _cash_flow_irr(cash_flows)
+    return {
+        **opportunity, "annual_kwh_saved": annual_kwh, "annual_cost_saved_vnd": annual_savings,
+        "annual_co2_saved_t": avoided, "annualization_method": method,
+        "simple_payback_years": simple_payback, "discounted_payback_years": discounted_payback,
+        "npv_vnd": npv, "irr_pct": 100 * irr if irr is not None else None,
+        "sir": pv_benefits / pv_costs if pv_costs else None,
+        "mac_vnd_per_tco2e": -npv / (avoided * lifetime) if avoided else None,
+        "ghg_scope1_tco2e": scope1, "biogenic_co2_t": biogenic,
+        "ghg_scope2_location_tco2e": scope2_loc, "ghg_scope2_market_tco2e": scope2_mkt,
+        "total_emissions_tco2e": scope1 + scope2_loc if scope2_loc is not None else None,
+    }
+
+def list_opportunities(
     df: pd.DataFrame,
     opportunities: Sequence[Mapping[str, object]],
     tariff: float | Mapping[str, float],
@@ -1229,9 +1235,11 @@ def calculate_sample_opportunities(
         # ------------------------------------------------------------
         # Tính giá điện (tariff) – an toàn khi days None
         # ------------------------------------------------------------
-        price = tariff
-        if row_rates is not None and days is not None:
-            # ``_reading`` trả về Series; .where(days.notna()) bảo an
+        if row_rates is None:
+            price = tariff
+        elif days is None:
+            price = None
+        else:
             price = _weighted_price(_reading(df, applies_to).where(days.notna()), row_rates)
 
         # ------------------------------------------------------------
@@ -1252,3 +1260,7 @@ def calculate_sample_opportunities(
         result["assumption"] += f" {annualization_note}"
         results.append(result)
     return results
+
+
+# Giữ điểm vào đã có cho các script dùng tên này.
+calculate_sample_opportunities = list_opportunities

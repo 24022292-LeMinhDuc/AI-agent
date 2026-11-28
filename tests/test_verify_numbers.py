@@ -1,11 +1,12 @@
 """Kiểm tra đối chiếu số với kết quả run giả lập."""
 
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
+
+import pytest
 
 import db
-import pytest
 from scripts.verify_numbers import verify_answer, verify_results
 
 
@@ -69,6 +70,16 @@ def test_verifies_numbers_against_their_own_citation() -> None:
     assert verify_results("Điện 1200 kWh [run_id: 1], kỳ sau 800 kWh [run_id: 2].", runs)["verified"]
 
 
+@pytest.mark.parametrize(("text", "verified"), [
+    ("Tiết kiệm 100 kWh", False), ("100 kWh tiết kiệm", False), ("Savings 100 kWh", False),
+    ("Thực đo 100 kWh, tiết kiệm 0 kWh", True), ("Đường cơ sở 105 kWh", True),
+    ("Thực đo 105 kWh", False), ("Tiết kiệm 0 kWh", True),
+])
+def test_energy_claim_matches_named_metric(text, verified):
+    runs = {1: {"summary": {"actual_kwh": 100, "expected_kwh": 105, "savings_kwh": 0}}}
+    assert verify_results(f"{text} [run_id: 1]", runs)["verified"] is verified
+
+
 def test_a_meter_reading_cannot_be_verified_using_a_date_count_or_another_meter() -> None:
     runs = {7: {"total_kwh": 1200, "chiller_kwh": 800, "period": "2025-07",
                 "energy_rows_by_column": {"kwh_chiller": 45}}}
@@ -101,6 +112,7 @@ def test_cli_runs_from_another_directory(tmp_path: Path, monkeypatch, from_file:
         source = tmp_path / "answer.txt"
         source.write_text(answer, encoding="utf-8")
         arguments.extend(["--file", str(source)])
-    result = subprocess.run(arguments, cwd=tmp_path, input=answer, capture_output=True, text=True, encoding="utf-8")
+    result = subprocess.run(arguments, cwd=tmp_path, input=answer, capture_output=True, text=True,
+                            encoding="utf-8", check=False)
     assert result.returncode == 0, result.stderr
     assert "Số không khớp: 0" in result.stdout

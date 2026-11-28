@@ -31,22 +31,26 @@ _load_environment()
 
 def create_client() -> genai.Client:
     """Khởi tạo client có giới hạn thời gian và thử lại lỗi tạm thời."""
-    return genai.Client(
-        api_key=os.environ["GEMINI_API_KEY"],
-        http_options=types.HttpOptions(
-            timeout=20_000,
-            retry_options=types.HttpRetryOptions(
-                attempts=2,
-                initial_delay=0.5,
-                max_delay=1.5,
-                jitter=0.1,
-                http_status_codes=list(RETRYABLE_STATUS_CODES),
+    try:
+        return genai.Client(
+            api_key=os.environ["GEMINI_API_KEY"],
+            http_options=types.HttpOptions(
+                timeout=20_000,
+                retry_options=types.HttpRetryOptions(
+                    attempts=2, initial_delay=0.5, max_delay=1.5, jitter=0.1,
+                    http_status_codes=list(RETRYABLE_STATUS_CODES),
+                ),
             ),
-        ),
-    )
+        )
+    except Exception as exc:
+        raise GeminiServiceError(error_message(exc)) from exc
 
 
-class GeminiUnavailableError(RuntimeError):
+class GeminiServiceError(RuntimeError):
+    """Lỗi tại biên SDK với thông báo phù hợp cho giao diện."""
+
+
+class GeminiUnavailableError(GeminiServiceError):
     """Gemini hoặc model được cấu hình đang không khả dụng."""
 
 
@@ -74,7 +78,7 @@ class GeminiSession:
                 if code not in (404, *RETRYABLE_STATUS_CODES) and status not in (
                     "NOT_FOUND", "UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED"
                 ):
-                    raise
+                    raise GeminiServiceError(error_message(exc)) from exc
                 continue
             self.active_model = model
             return response
@@ -93,7 +97,7 @@ def generate_content(
 
 def error_message(error: Exception) -> str:
     """Trả thông báo có thể hiển thị mà không đưa chi tiết SDK ra giao diện."""
-    if isinstance(error, GeminiUnavailableError):
+    if isinstance(error, GeminiServiceError):
         return str(error)
     code = getattr(error, "code", None)
     if code in (401, 403):

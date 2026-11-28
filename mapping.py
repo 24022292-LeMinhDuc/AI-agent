@@ -8,6 +8,7 @@ import re
 from collections.abc import Mapping, Sequence
 from math import isfinite
 from pathlib import Path
+from typing import TypedDict
 
 import jsonschema
 import pandas as pd
@@ -15,8 +16,8 @@ import yaml
 from google.genai import types
 
 from gemini_service import create_client, generate_content
-from tools import finite_readings, normalize_label as _normalize_text, reporting_timestamps
-
+from tools import finite_readings, reporting_timestamps
+from tools import normalize_label as _normalize_text
 
 _SCHEMA_HEADERS = {
     "Ngay": "timestamp",
@@ -68,6 +69,18 @@ _BOUNDED_FIELDS = {
 }
 
 
+_KWH_FACTORS = {"Wh": 0.001, "kWh": 1.0, "MWh": 1000.0, "GWh": 1_000_000.0}
+_ENERGY_UNITS = {unit.lower() for unit in _KWH_FACTORS}
+
+
+class UnitIssue(TypedDict):
+    column: str
+    canonical: str
+    warning: str
+    unit: str
+    factor: float
+
+
 def _unit_words(normalized_name: str) -> set[str]:
     """Nhận diện cách ghi như kWh, kW h và kW-hour."""
     normalized_name = re.sub(r"\b([kmg]?w)\s+(?:h|hours?)\b", r"\1h", normalized_name)
@@ -116,7 +129,7 @@ def _keyword_mapping(columns: Sequence[object]) -> dict[str, str]:
         if "%" in name and normalized in {"ty le lap day", "occupancy rate"}:
             mapping[name] = "occupancy_pct"
             continue
-        if words & {"kw", "mw", "gw", "w"} and not words & {"kwh", "mwh"}:
+        if words & {"kw", "mw", "gw", "w"}:
             if "kw" in words and ("cuc dai" in normalized or "peak demand" in normalized):
                 target = "peak_demand_kw"
             mapping[name] = target
@@ -128,7 +141,7 @@ def _keyword_mapping(columns: Sequence[object]) -> dict[str, str]:
         elif words & {"temp", "temperature", "ambient"} or "nhiet do" in normalized:
             target = "temp_c"
         else:
-            is_energy = bool(words & {"kwh", "mwh", "electric", "electricity", "dien", "power"})
+            is_energy = bool(words & (_ENERGY_UNITS | {"electric", "electricity", "dien", "power"}))
             if is_energy and words & {"total", "tong"}:
                 target = "kwh_total"
             elif is_energy and ("phu tro" in normalized or words & {"auxiliary", "other"}):
@@ -207,14 +220,14 @@ def suggest_mapping(df: pd.DataFrame, *, use_ai: bool = True) -> dict[str, str]:
             column: _HEADER_LOOKUP.get(_normalize_text(column), suggested[column])
             for column in columns
         }
-    except Exception:
+    except (RuntimeError, ValueError, TypeError, jsonschema.ValidationError):
         return fallback
 
 
 def detect_unit_issues(
     df: pd.DataFrame, mapping: Mapping[str, str]
-) -> list[dict[str, str]]:
-    """Cảnh báo cột điện có tên MWh hoặc giá trị nhỏ bất thường."""
+) -> list[UnitIssue]:
+    """Đề xuất đúng hệ số cho đơn vị ghi trong tên cột hoặc số đo bất thường."""
     electrical_columns = [
         (source, target)
         for source, target in mapping.items()
@@ -227,12 +240,13 @@ def detect_unit_issues(
         if not positive_values.empty:
             positive_means[source] = float(positive_values.mean())
 
-    warnings: list[dict[str, str]] = []
+    warnings: list[UnitIssue] = []
     for source, target in electrical_columns:
         words = _unit_words(_normalize_text(source))
         reasons: list[str] = []
-        if "mwh" in words:
-            reasons.append("tên cột có đơn vị MWh")
+        unit = next((unit for unit in _KWH_FACTORS if unit != "kWh" and unit.lower() in words), None)
+        if unit:
+            reasons.append(f"tên cột có đơn vị {unit}")
 
         current_mean = positive_means.get(source)
         other_means = [
@@ -249,6 +263,8 @@ def detect_unit_issues(
                 {
                     "column": str(source),
                     "canonical": target,
+                    "unit": unit or "MWh",
+                    "factor": _KWH_FACTORS[unit or "MWh"],
                     "warning": ". ".join(reasons)
                     + ". Hãy kiểm tra đơn vị trước khi xác nhận.",
                 }
@@ -316,6 +332,8 @@ def apply_mapping(
     df: pd.DataFrame,
     mapping: Mapping[str, str],
     unit_factors: Mapping[str, float] | None,
+    *,
+    cdd_base_temp_c: float | None = None,
 ) -> pd.DataFrame:
     """Đổi tên, áp dụng hệ số đã xác nhận và tính CDD."""
     if df.columns.has_duplicates:
@@ -355,13 +373,16 @@ def apply_mapping(
             continue
         if target.startswith("kwh_"):
             words = _unit_words(_normalize_text(source))
-            if words & {"kw", "mw", "gw", "w"} and not words & {"kwh", "mwh"}:
+            if words & {"kw", "mw", "gw", "w"}:
                 raise ValueError(f"Cột {source} chứa công suất. Hãy cung cấp điện năng theo từng khoảng đo (kWh hoặc MWh).")
+            if len(words & _ENERGY_UNITS) > 1:
+                raise ValueError(f"Cột {source} ghi nhiều đơn vị điện năng. Hãy xác định một đơn vị nguồn.")
             factor = float(factors.get(str(source), factors.get(target, 1.0)))
             if not isfinite(factor) or factor <= 0:
                 raise ValueError(f"Hệ số quy đổi của cột {source} phải là số hữu hạn dương.")
-            if "mwh" in words and factor != 1000:
-                raise ValueError(f"Cần xác nhận đổi cột {source} từ MWh sang kWh (×1.000).")
+            for unit, expected in _KWH_FACTORS.items():
+                if unit != "kWh" and unit.lower() in words and factor != expected:
+                    raise ValueError(f"Cần xác nhận đổi cột {source} từ {unit} sang kWh (×{expected:g}).")
             result[target] = finite_readings(finite_readings(raw) * factor)
             continue
 
@@ -386,7 +407,9 @@ def apply_mapping(
     ordered_columns = [column for column in CANONICAL_COLUMNS if column in result.columns]
     result = result.loc[:, ordered_columns]
     if "temp_c" in result.columns:
-        base_temp = _load_cdd_base_temp()
+        base_temp = _load_cdd_base_temp() if cdd_base_temp_c is None else cdd_base_temp_c
+        if not isfinite(base_temp):
+            raise ValueError("Nhiệt độ cơ sở CDD phải hữu hạn.")
         temperature = result["temp_c"]
         result["cdd"] = (temperature - base_temp).clip(lower=0)
     if issues:

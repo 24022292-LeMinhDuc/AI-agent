@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from tools import (
     aggregate_consumption,
@@ -10,12 +11,47 @@ from tools import (
     dashboard_analysis,
     dataset_summary,
     enpi_regression,
+    evaluate_ecm_financials,
     list_opportunities,
     opportunity,
     resolve_measurement_rows,
     seu_pareto,
     total_kwh,
 )
+
+
+def test_filtered_coverage_preserves_interpolation_provenance():
+    raw = pd.DataFrame({"timestamp": pd.date_range("2026-01-01", periods=5),
+                        "kwh_chiller": [10, -1, 14, 20, None]})
+    cleaned, _ = clean(raw, ["kwh_chiller"])
+    result = dashboard_analysis(cleaned, "day", ["kwh_chiller"], "2026-01-02", "2026-01-05", 1, audit_df=raw)
+    assert result["summary"]["energy_coverage_by_column"]["kwh_chiller"] == {
+        "measured": 2, "interpolated": 1, "missing": 1,
+    }
+    assert cleaned.loc[1, "kwh_chiller"] == 12
+
+
+@pytest.mark.parametrize(("benefit", "irr"), [(300, 200), (100, 0), (25, -75), (0, None)])
+def test_ecm_cash_flow_and_scope2(benefit, irr):
+    ecm = {"annual_kwh": benefit, "coverage_days": 30, "tariff_vnd_per_kwh": 1,
+           "capex_vnd": 100, "lifetime_years": 1, "annual_opex_vnd": 0, "kwh_total": 1000}
+    ghg = {"default_grid_ef_kgco2e_per_kwh": 0.6592, "irec_kwh": 2000}
+    result = evaluate_ecm_financials(ecm, {"discount_rate": 0}, ghg)
+    if irr is None:
+        assert result["irr_pct"] is None
+    else:
+        assert result["irr_pct"] == pytest.approx(irr)
+    assert result["annual_kwh_saved"] == benefit
+    assert result["ghg_scope2_market_tco2e"] == 0
+    assert result["total_emissions_tco2e"] == pytest.approx(0.6592)
+    assert result["npv_vnd"] == benefit - 100
+
+
+def test_time_of_use_price_without_dates_has_no_annual_opportunity_estimate():
+    result, = list_opportunities(pd.DataFrame({"kwh_chiller": [15]}),
+                                 [{"name": "Chiller", "applies_to": "kwh_chiller",
+                                   "saving_pct": 0.1, "capex_vnd": 10}], {"normal": 1}, None)
+    assert result["saved_kwh"] is None and result["saved_vnd"] is None
 
 
 def test_total_kwh_and_monthly_aggregation() -> None:

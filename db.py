@@ -7,13 +7,12 @@ import math
 import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-
 
 DB_PATH = Path(__file__).with_name("runs.db")
 SCHEMA_VERSION = 1
@@ -106,7 +105,7 @@ def log_run(tool: str, args: dict[str, Any], result: Any, *, scope_id: str = "")
     with closing(_connect()) as connection, connection:
         cursor = connection.execute(
             "INSERT INTO runs (ts, tool, args_json, result_json, scope_id) VALUES (?, ?, ?, ?, ?)",
-            (datetime.now(timezone.utc).isoformat(), tool, args_json, result_json, scope_id),
+            (datetime.now(UTC).isoformat(), tool, args_json, result_json, scope_id),
         )
         return int(cursor.lastrowid)
 
@@ -147,7 +146,7 @@ def save_decision(name: str, status: str, scope_id: str = "") -> None:
     with closing(_connect()) as connection, connection:
         connection.execute(
             "INSERT INTO decisions (opportunity_name, status, ts, scope_id) VALUES (?, ?, ?, ?)",
-            (name, status, datetime.now(timezone.utc).isoformat(), scope_id),
+            (name, status, datetime.now(UTC).isoformat(), scope_id),
         )
 
 

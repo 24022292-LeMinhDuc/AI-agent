@@ -15,7 +15,6 @@ from scipy.stats import t
 
 from tools import finite_readings, reporting_timestamps, resolve_measurement_rows
 
-
 BASELINE_DRIVER_LABELS = {
     "production_t": "Sản lượng (tấn)",
     "cdd": "CDD",
@@ -344,9 +343,9 @@ def _uncertainty(
     before, after = fit.residual[:-1][adjacent], fit.residual[1:][adjacent]
     mean_y = float(sample["actual_kwh"].mean())
     rho = None
-    if len(before) >= 3 and np.ptp(before) > 0 and np.ptp(after) > 0:
-        if np.max(np.abs(fit.residual)) > 32 * np.finfo(float).eps * mean_y:
-            rho = float(np.clip(np.corrcoef(before, after)[0, 1], -1.0, 1.0))
+    if (len(before) >= 3 and np.ptp(before) > 0 and np.ptp(after) > 0
+            and np.max(np.abs(fit.residual)) > 32 * np.finfo(float).eps * mean_y):
+        rho = float(np.clip(np.corrcoef(before, after)[0, 1], -1.0, 1.0))
     # Không giảm độ bất định khi mẫu cho thấy tự tương quan âm.
     positive_rho = max(0.0, rho or 0.0)
     n_effective = len(sample) * (1 - positive_rho) / (1 + positive_rho)
@@ -643,10 +642,10 @@ def normalized_baseline(
             "Mỗi dòng đủ điều kiện là một ngày đo và ranh giới đo giống nhau ở hai kỳ.",
             "Điện tham chiếu lấy từ mô hình kỳ cơ sở với biến liên quan đo tại kỳ báo cáo.",
             "NRA có dấu, cộng dồn khi trùng ngày và áp dụng trên các ngày báo cáo đủ dữ liệu.",
-            "FSU theo ngày phản ánh bất định mô hình. Điểm gãy được giữ cố định khi tính FSU. "
-            "Sai số công tơ và bất định của NRA cần được đánh giá trong kế hoạch M&V.",
+            ("FSU theo ngày phản ánh bất định mô hình. Điểm gãy được giữ cố định khi tính FSU. "
+             "Sai số công tơ và bất định của NRA cần được đánh giá trong kế hoạch M&V."),
             "Kỳ cơ sở cần đại diện cho các chế độ vận hành và mùa liên quan.",
-            "Kết quả phản ánh chênh lệch theo mô hình. Cần đánh giá thay đổi vận hành và "
-            "ranh giới đo để xác nhận tiết kiệm của một giải pháp.",
+            ("Kết quả phản ánh chênh lệch theo mô hình. Cần đánh giá thay đổi vận hành và "
+             "ranh giới đo để xác nhận tiết kiệm của một giải pháp."),
         ],
     }

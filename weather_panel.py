@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -11,7 +11,6 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from weather_api import WeatherAPIError, WeatherSnapshot, fetch_hourly_weather
-
 
 Location = tuple[str, float, float]
 DEMO_LOCATION: Location = ("TP. Hồ Chí Minh (mẫu)", 10.7769, 106.7009)
@@ -103,7 +102,7 @@ def _temperature_figure(snapshot: WeatherSnapshot) -> go.Figure:
 @st.fragment(run_every="1min")
 def _show_weather_snapshot(state: dict[str, Any], location: Location) -> None:
     """Kiểm tra giờ hiện tại mà không chạy lại các phép tính năng lượng."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     snapshot, error = _refresh_weather(state, location, now)
     if error:
         message = f"{error} Đang hiển thị lần tải gần nhất." if snapshot else error

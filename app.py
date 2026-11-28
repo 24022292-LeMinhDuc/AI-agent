@@ -12,8 +12,11 @@ from collections.abc import Callable
 from datetime import timedelta
 from html import escape
 from io import BytesIO, TextIOWrapper
+from math import isfinite
 from pathlib import Path
 from typing import Any
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -23,7 +26,11 @@ from plotly.subplots import make_subplots
 
 import db
 from agent import ask, run_tool
-from energy_baseline import BASELINE_DRIVER_LABELS, BASELINE_MODEL_TYPES, DEFAULT_HDD_BASE_TEMP_C
+from energy_baseline import (
+    BASELINE_DRIVER_LABELS,
+    BASELINE_MODEL_TYPES,
+    DEFAULT_HDD_BASE_TEMP_C,
+)
 from mapping import (
     CANONICAL_COLUMNS,
     apply_mapping,
@@ -41,7 +48,6 @@ from report import (
 )
 from tools import TOTAL_METER, submeter_columns, total_meter_columns
 from weather_panel import show_hourly_weather
-
 
 CATEGORY_LABELS = {
     "kwh_production": "Điện sản xuất",
@@ -74,11 +80,14 @@ PAGES = {
     "Hỏi đáp": (5, ":material/forum:"),
 }
 MAX_DERIVED_CACHE_ENTRIES = 24
+UPLOAD_ERRORS = (ValueError, OSError, KeyError, TypeError, BadZipFile, ParseError, ImportError, EOFError)
 
 
 def _apply_styles() -> None:
     """Nạp kiểu trình bày dùng chung cho giao diện."""
-    st.html(Path(__file__).with_name("assets") / "workspace.css")
+    stylesheet = Path(__file__).resolve().parent / "assets" / "workspace.css"
+    if stylesheet.is_file():
+        st.html(stylesheet)
 
 
 def _render_navigation() -> str:
@@ -147,7 +156,17 @@ def _load_config() -> dict[str, Any]:
     """Đọc cấu hình local của ứng dụng."""
     config_path = Path(__file__).with_name("config.yaml")
     with config_path.open("r", encoding="utf-8") as config_file:
-        return yaml.safe_load(config_file) or {}
+        config = yaml.safe_load(config_file)
+    if not isinstance(config, dict):
+        raise TypeError("config.yaml phải chứa bảng cấu hình.")
+    if type(config.get("cdd_base_temp_c")) not in (int, float):
+        raise TypeError("Cần nhiệt độ cơ sở CDD dạng số trong config.yaml.")
+    if not isfinite(config["cdd_base_temp_c"]):
+        raise ValueError("Nhiệt độ cơ sở CDD phải hữu hạn.")
+    threshold = config.get("seu_threshold", 0.8)
+    if type(threshold) not in (int, float) or not 0 <= threshold <= 1:
+        raise ValueError("Ngưỡng SEU phải từ 0 đến 1.")
+    return config
 
 
 def _read_upload_bytes(
@@ -244,13 +263,18 @@ def _clear_dataset_state() -> None:
 
 
 def _decision_scope_id(store: dict[str, Any]) -> str:
-    """Tạo phạm vi ổn định quyết định theo session, file và mapping."""
+    """Gắn quyết định với hồ sơ đo và giả định dùng để duyệt."""
+    local_only = st.get_option("server.address") in {"127.0.0.1", "::1", "localhost"}
+    config = store["config"]
     scope = {
-        "session": store.get("session_scope_id", ""),
-        "file": store.get("upload_fingerprint", ""),
+        "owner": "local" if local_only else store["session_scope_id"],
+        "file": store["upload_fingerprint"],
         "sheet": store.get("upload_sheet"),
         "mapping": store.get("confirmed_mapping", {}),
         "unit_factors": store.get("confirmed_unit_factors", {}),
+        "opportunities": config.get("opportunities", []),
+        "tariff": config.get("tariff_vnd_per_kwh"),
+        "emission_factor": config.get("emission_factor_kg_per_kwh"),
     }
     encoded = json.dumps(scope, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -581,13 +605,15 @@ def _show_dashboard(store: dict[str, Any]) -> None:
                     hide_index=True,
                     width="stretch",
                 )
-    energy_rows = summary.get("energy_rows_by_column", {})
-    if energy_rows:
+    energy_coverage = summary.get("energy_coverage_by_column", {})
+    if energy_coverage:
         with st.expander("Độ phủ số đo trong khoảng đã chọn"):
             coverage = pd.DataFrame(
                 {
-                    "Hạng mục": [CATEGORY_LABELS.get(name, name) for name in energy_rows],
-                    "Dòng có số đo": list(energy_rows.values()),
+                    "Hạng mục": [CATEGORY_LABELS.get(name, name) for name in energy_coverage],
+                    "Số đo hợp lệ": [item["measured"] for item in energy_coverage.values()],
+                    "Đã nội suy": [item["interpolated"] for item in energy_coverage.values()],
+                    "Còn thiếu": [item["missing"] for item in energy_coverage.values()],
                 }
             )
             st.dataframe(coverage, hide_index=True, width="stretch")
@@ -733,6 +759,13 @@ def _show_seu_enpi(store: dict[str, Any]) -> None:
                          "Giải thích phân bổ chi phí TOU, khả năng dịch tải, hệ số phụ tải và cos φ của kỳ đo.")
 
 
+def _remember_report_run(store: dict[str, Any], key: str, response: dict[str, Any]) -> None:
+    """Vô hiệu hóa cả ba bản xuất khi bằng chứng trong hồ sơ thay đổi."""
+    if store.get("report_export") and response["run_id"] not in store["report_export"]["run_ids"]:
+        store.pop("report_export")
+    store.setdefault("analysis_results", {})[key] = response
+
+
 def _show_audit_tool(
     store: dict[str, Any], tool: str, title: str, render: Callable[[dict], None], question: str,
 ) -> None:
@@ -745,7 +778,7 @@ def _show_audit_tool(
         st.error(error)
         return
     run_id = response["run_id"]
-    store.setdefault("analysis_results", {})[tool] = response
+    _remember_report_run(store, tool, response)
     st.caption(f"Toàn bộ dữ liệu đã xác nhận · run_id {run_id}")
     _show_interval_quality(result["interval_quality"])
     for warning in result.get("warnings", []):
@@ -786,7 +819,7 @@ def _show_energy_balance(result: dict) -> None:
                   "thickness": 16, "pad": 18},
             link={field: [link[field] for link in links] for field in ("source", "target", "value")},
         ))
-        diagram.update_layout(title="Phân bổ năng lượng đầu vào", margin=dict(l=12, r=12, t=45, b=12))
+        diagram.update_layout(title="Phân bổ năng lượng đầu vào", margin={"l": 12, "r": 12, "t": 45, "b": 12})
         st.plotly_chart(diagram, width="stretch")
     if rows := result["seu_breakdown"]:
         table = pd.DataFrame(rows)
@@ -823,7 +856,7 @@ def _show_tariff_power_quality(result: dict) -> None:
             if not data.empty:
                 figure.add_bar(x=data["month"], y=data["kwh"], name=label, marker_color=color)
         figure.update_layout(title="Điện theo tháng và khung giờ", barmode="stack", yaxis_title="kWh",
-                             xaxis_type="category", legend_orientation="h", margin=dict(l=12, r=12, t=45, b=12))
+                             xaxis_type="category", legend_orientation="h", margin={"l": 12, "r": 12, "t": 45, "b": 12})
         st.plotly_chart(figure, width="stretch")
         table = pd.DataFrame(result["tou"])
         table["period"] = table["period"].map({key: label for key, (label, _) in periods.items()})
@@ -889,7 +922,7 @@ def _show_electric_seu_enpi(store: dict[str, Any]) -> None:
     if isinstance(pareto, dict) and "error" in pareto:
         st.error(pareto["error"])
         return
-    store.setdefault("analysis_results", {})["seu"] = seu_response
+    _remember_report_run(store, "seu", seu_response)
     if pareto.empty:
         st.info("Cần số đo theo phụ tải để phân tích Pareto SEU.")
     else:
@@ -960,7 +993,7 @@ def _show_electric_seu_enpi(store: dict[str, Any]) -> None:
     if isinstance(enpi_result, dict) and "error" in enpi_result:
         st.info(f"Chưa đủ dữ liệu để tính EnPI: {enpi_result['error']}")
         return
-    store.setdefault("analysis_results", {})["enpi"] = enpi_response
+    _remember_report_run(store, "enpi", enpi_response)
 
     st.caption(f"Nguồn EnPI · run_id {enpi_response['run_id']}")
     coefficients = enpi_result["coefficients"]
@@ -1109,11 +1142,11 @@ def _show_baseline_result(store: dict[str, Any], response: dict[str, Any]) -> No
         figure.update_layout(
             barmode="group",
             height=285,
-            margin=dict(l=10, r=10, t=15, b=10),
+            margin={"l": 10, "r": 10, "t": 15, "b": 10},
             paper_bgcolor="#ffffff",
             plot_bgcolor="#ffffff",
             yaxis_title="Điện năng (kWh)",
-            legend=dict(orientation="h", y=1.12),
+            legend={"orientation": "h", "y": 1.12},
         )
         figure.update_xaxes(type="category", title="Tháng báo cáo")
         figure.update_yaxes(gridcolor="#e8efed")
@@ -1129,7 +1162,7 @@ def _show_baseline_result(store: dict[str, Any], response: dict[str, Any]) -> No
         figure.add_hline(y=0, line_dash="dot", line_color="#83948e")
         figure.update_layout(
             title="Chênh lệch tích lũy (CUSUM)", height=295,
-            margin=dict(l=10, r=10, t=55, b=10), xaxis_title="Ngày đủ điều kiện",
+            margin={"l": 10, "r": 10, "t": 55, "b": 10}, xaxis_title="Ngày đủ điều kiện",
             yaxis_title="Chênh lệch (kWh)", hovermode="x unified",
         )
         figure.update_xaxes(type="date")
@@ -1388,9 +1421,8 @@ def _show_energy_baseline(store: dict[str, Any]) -> None:
             if error := response.get("error") or response.get("result", {}).get("error"):
                 st.error(error)
                 return
-            analysis_results["energy_baseline"] = response
+            _remember_report_run(store, "energy_baseline", response)
             store["baseline_args"] = args
-            store.pop("report_export", None)
 
         if response := analysis_results.get("energy_baseline"):
             _show_baseline_result(store, response)
@@ -1401,10 +1433,9 @@ def _show_opportunities(store: dict[str, Any]) -> None:
     if not _show_mapping_guide(store):
         return
 
-    response = store.get("opportunities_tool_response")
-    if response is None:
+    response = store.get("opportunities_tool_response") or store.get("analysis_results", {}).get("opportunities")
+    if response is None or not isinstance(response.get("result"), list):
         response = run_tool("list_opportunities", {}, store)
-        store["opportunities_tool_response"] = response
     if "run_id" not in response:
         st.error(response.get("error", "Không thể tính danh sách cơ hội."))
         return
@@ -1413,7 +1444,8 @@ def _show_opportunities(store: dict[str, Any]) -> None:
         return
 
     opportunities = response.get("result", [])
-    store.setdefault("analysis_results", {})["opportunities"] = response
+    store["opportunities_tool_response"] = response
+    _remember_report_run(store, "opportunities", response)
     st.caption(
         f"Cơ hội từ config.yaml · nguồn run_id {response['run_id']} · "
         "tỷ lệ tiết kiệm, giá điện và vốn đầu tư là giả định."
@@ -1423,6 +1455,7 @@ def _show_opportunities(store: dict[str, Any]) -> None:
         return
 
     decision_scope = store.get("decision_scope_id") or _decision_scope_id(store)
+    store["decision_scope_id"] = decision_scope
     decisions = db.latest_decisions(decision_scope)
     status_labels = {"Approve": "Đã duyệt", "Reject": "Đã từ chối"}
     st.dataframe(
@@ -1635,6 +1668,8 @@ def _register_source(
     )
     if not same_source:
         _invalidate_dataset_state(store)
+    elif store.get("filename") != filename:
+        store.pop("report_export", None)
     store.update(
         filename=filename,
         upload_size_bytes=len(content),
@@ -1649,7 +1684,7 @@ def _register_source(
             with pd.ExcelFile(BytesIO(content)) as workbook:
                 store["upload_sheet_names"] = workbook.sheet_names
             store["workbook_content"] = content
-        except Exception as exc:
+        except UPLOAD_ERRORS as exc:
             store["upload_error"] = str(exc)
     else:
         _load_upload_draft(store, content)
@@ -1659,7 +1694,7 @@ def _load_upload_draft(store: dict[str, Any], content: bytes) -> None:
     """Đọc bảng đang chọn và tạo bản nháp ánh xạ cục bộ."""
     try:
         raw_df = _read_upload_bytes(store["filename"], content, store.get("upload_sheet", 0))
-    except Exception as exc:
+    except UPLOAD_ERRORS as exc:
         store["upload_error"] = str(exc)
         return
     suggested = suggest_mapping(raw_df, use_ai=False)
@@ -1808,13 +1843,13 @@ def _show_data_page(store: dict[str, Any]) -> None:
                 f"unit_{store['upload_fingerprint']}_{store.get('upload_sheet')}_"
                 f"{warning['column']}"
             )
-            confirmed_mwh = st.checkbox(
-                f"Xác nhận {warning['column']} là MWh và đổi sang kWh (×1.000)",
+            confirmed_unit = st.checkbox(
+                f"Xác nhận {warning['column']} là {warning['unit']} và đổi sang kWh (×{warning['factor']:g})",
                 key=unit_key,
                 value=unit_key not in st.session_state and warning["column"] in saved_factors,
             )
-            if confirmed_mwh:
-                unit_factors[warning["column"]] = 1000.0
+            if confirmed_unit:
+                unit_factors[warning["column"]] = warning["factor"]
 
         mapping_changed = (
             store.get("mapping_confirmed")
@@ -1837,7 +1872,8 @@ def _show_data_page(store: dict[str, Any]) -> None:
             disabled=bool(store.get("mapping_confirmed")),
         ):
             try:
-                mapped_df = apply_mapping(raw_df, current_mapping, unit_factors)
+                mapped_df = apply_mapping(raw_df, current_mapping, unit_factors,
+                                          cdd_base_temp_c=store["config"]["cdd_base_temp_c"])
                 validation_errors = validate_mapped_data(mapped_df)
                 if validation_errors:
                     raise ValueError(" ".join(validation_errors))
@@ -1906,12 +1942,13 @@ def _show_data_page(store: dict[str, Any]) -> None:
                     f"{len(normalized_df):,} dòng · {len(normalized_df.columns):,} cột chuẩn · "
                     f"{int(normalized_df.isna().sum().sum()):,} ô trống"
                 )
-                st.dataframe(normalized_df.head(10), hide_index=True, width="stretch")
+                preview = normalized_df.head(10).copy()
+                preview.attrs.clear()
+                st.dataframe(preview, hide_index=True, width="stretch")
 
-    with guide_column:
-        with st.container(border=True):
-            st.markdown(
-                """
+    with guide_column, st.container(border=True):
+        st.markdown(
+            """
                 <div class="ve-hint-card">
                   <strong>⚡ Gợi ý dữ liệu</strong>
                   <p>✓ Thời gian (datetime)</p>
@@ -1920,11 +1957,11 @@ def _show_data_page(store: dict[str, Any]) -> None:
                   <p>✓ Nhiệt độ hoặc biến liên quan</p>
                 </div>
                 """,
-                unsafe_allow_html=True,
-            )
-            st.caption("Dữ liệu xem trước")
-            st.dataframe(raw_df.head(6), hide_index=True, width="stretch")
-            st.info("Kiểm tra đơn vị và mapping trước khi xác nhận để cập nhật phân tích.")
+            unsafe_allow_html=True,
+        )
+        st.caption("Dữ liệu xem trước")
+        st.dataframe(raw_df.head(6), hide_index=True, width="stretch")
+        st.info("Kiểm tra đơn vị và mapping trước khi xác nhận để cập nhật phân tích.")
 
 
 def _show_report_export(store: dict[str, Any]) -> None:
@@ -1935,7 +1972,7 @@ def _show_report_export(store: dict[str, Any]) -> None:
     with st.container(border=True):
         st.subheader("Hồ sơ kiểm toán")
         st.caption(
-            "Báo cáo dùng dữ liệu đã xác nhận, kết quả phân tích và các quyết định của phiên."
+            "Báo cáo dùng dữ liệu đã xác nhận, kết quả phân tích và các quyết định của hồ sơ."
         )
         baseline = store.get("analysis_results", {}).get("energy_baseline")
         if baseline and "error" not in baseline.get("result", {}):
@@ -1946,17 +1983,36 @@ def _show_report_export(store: dict[str, Any]) -> None:
                 with st.spinner("Đang tạo báo cáo..."):
                     report_data = build_report_data(store)
                     interpretation = generate_interpretation(report_data)
+                    plan = report_data["action_plan"]
                     store["report_export"] = {
                         "markdown": render_markdown(report_data, interpretation),
                         "docx": render_docx(report_data, interpretation),
                         "json": render_report_json(report_data),
                         "run_ids": report_data["run_ids"],
+                        "decisions": {
+                            item["name"]: status
+                            for group, status in (("approved", "Approve"), ("rejected", "Reject"),
+                                                  ("waiting_for_approval", None))
+                            for item in plan[group]
+                        },
+                        "errors": [run["result"]["error"] for run in report_data["tool_runs"]
+                                   if isinstance(run["result"], dict) and "error" in run["result"]],
                     }
-            except (ValueError, KeyError) as exc:
+            except (ValueError, TypeError, KeyError, OSError, sqlite3.Error) as exc:
+                store.pop("report_export", None)
                 st.error(f"Không thể tạo báo cáo: {exc}")
 
         if report_export := store.get("report_export"):
-            st.success("Hồ sơ đã sẵn sàng để tải xuống.")
+            current = db.latest_decisions(store["decision_scope_id"])
+            snapshot = report_export.get("decisions")
+            if snapshot is None or any(current.get(name) != status for name, status in snapshot.items()):
+                store.pop("report_export")
+                st.info("Quyết định đã thay đổi. Xuất lại báo cáo để tải hồ sơ hiện tại.")
+                return
+            if report_export.get("errors"):
+                st.warning("Hồ sơ có phần tính toán gặp lỗi: " + " · ".join(report_export["errors"]))
+            else:
+                st.success("Hồ sơ đã sẵn sàng để tải xuống.")
             st.caption(f"Nguồn tính toán · {', '.join(map(str, report_export['run_ids']))}")
             formats = (
                 ("docx", "Tải Word", "bao_cao_kiem_toan_nang_luong.docx",
@@ -1999,15 +2055,20 @@ def main() -> None:
     )
     _apply_styles()
 
-    if "store" not in st.session_state:
-        st.session_state["store"] = {"config": _load_config()}
-    store: dict[str, Any] = st.session_state["store"]
-    if "config" not in store:
-        store["config"] = _load_config()
+    store: dict[str, Any] = st.session_state.setdefault("store", {})
+    if not isinstance(store.get("config"), dict):
+        try:
+            store["config"] = _load_config()
+        except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+            st.error(f"Không thể nạp cấu hình ứng dụng: {exc}")
+            return
     if "session_scope_id" not in store:
         store["session_scope_id"] = uuid.uuid4().hex
     if "run_scope_id" not in store:
         store["run_scope_id"] = uuid.uuid4().hex
+    if store.get("mapping_confirmed") and not store.get("decision_scope_id"):
+        store["decision_scope_id"] = (_decision_scope_id(store) if store.get("upload_fingerprint")
+                                      else store["run_scope_id"])
 
     current_page = _render_navigation()
     with st.container(key="ve_main_layout"):
@@ -2037,4 +2098,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except sqlite3.Error:
+        st.error("Không thể đọc hoặc ghi lịch sử SQLite. Kiểm tra quyền truy cập và thử lại.")
+

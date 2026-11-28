@@ -11,9 +11,8 @@ import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
-import db
 import agent
-
+import db
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -38,6 +37,43 @@ def test_sample_loader_and_dedicated_report_page(monkeypatch, tmp_path: Path) ->
     archive = json.loads(app.session_state["store"]["report_export"]["json"])
     assert archive["metadata"]["source_file"] == "sample_a.csv"
     assert archive["run_ids"]
+    assert archive["metadata"]["source_sha256"] == store["upload_fingerprint"]
+
+    app.button(key="nav_3_SEU & EnPI").click().run()
+    app.button(key="nav_6_Báo cáo").click().run()
+    assert "report_export" not in app.session_state["store"]
+    app.button(key="export_energy_report").click().run()
+    updated = json.loads(app.session_state["store"]["report_export"]["json"])
+    assert {"energy_balance", "tariff_power_quality"} <= updated.keys()
+    assert not app.exception
+
+
+def test_local_decisions_survive_reopen_and_refresh_cached_report(tmp_path, monkeypatch):
+    import streamlit as st
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "runs.db")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    get_option = st.get_option
+    monkeypatch.setattr(st, "get_option", lambda key: "127.0.0.1" if key == "server.address" else get_option(key))
+
+    def open_case():
+        app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+        app.button(key="load_sample_dataset").click().run()
+        fingerprint = app.session_state["store"]["upload_fingerprint"]
+        app.button(key=f"confirm_{fingerprint}").click().run()
+        app.button(key="nav_4_Cơ hội").click().run()
+        return app
+
+    first = open_case()
+    first.button(key="approve_opportunity_0").click().run()
+    first.button(key="export_energy_report").click().run()
+    second = open_case()
+    assert second.button(key="approve_opportunity_0").disabled
+    assert first.session_state["store"]["run_scope_id"] != second.session_state["store"]["run_scope_id"]
+    second.button(key="reject_opportunity_0").click().run()
+    first.run()
+    assert "report_export" not in first.session_state["store"]
+    assert not first.exception and not second.exception
 
 
 def test_dashboard_keeps_submeter_and_audit_data_when_period_has_no_total(

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.client import HTTPException
 from json import loads
 from math import isfinite
@@ -11,7 +12,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
-
 
 _FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 _VARIABLES = "temperature_2m,relative_humidity_2m"
@@ -53,7 +53,7 @@ def _timestamp(value: object, zone: ZoneInfo) -> datetime:
     """Quy đổi mốc Unix sang giờ địa phương, kể cả khi đổi giờ mùa hè."""
     if type(value) is not int:
         raise ValueError("Mốc Unix phải là số nguyên.")
-    return datetime.fromtimestamp(value, tz=timezone.utc).astimezone(zone)
+    return datetime.fromtimestamp(value, tz=UTC).astimezone(zone)
 
 
 def _reading_value(value: object) -> float | None:
@@ -99,14 +99,14 @@ def _parse_snapshot(body: bytes) -> WeatherSnapshot:
                 strict=True,
             )
         )
-        if any(after <= before for before, after in zip(epochs, epochs[1:])):
+        if any(after <= before for before, after in itertools.pairwise(epochs)):
             raise ValueError("Mốc giờ phải tăng dần theo thời gian.")
     except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
         raise WeatherAPIError("Open-Meteo trả dữ liệu thời tiết không hợp lệ.") from exc
 
     if current.temperature_c is None and all(reading.temperature_c is None for reading in readings):
         raise WeatherAPIError("Open-Meteo chưa có dữ liệu nhiệt độ cho vị trí này.")
-    return WeatherSnapshot(zone.key, datetime.now(timezone.utc), current, readings)
+    return WeatherSnapshot(zone.key, datetime.now(UTC), current, readings)
 
 
 def fetch_hourly_weather(

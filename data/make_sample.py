@@ -9,7 +9,6 @@ from tempfile import NamedTemporaryFile
 import numpy as np
 import pandas as pd
 
-
 SEED = 42
 SENSOR_ERROR_ROWS = (17, 88, 162, 247, 330)
 MISSING_LIGHTING_ROWS = (105, 106, 107, 108)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -14,9 +14,8 @@ import db
 import weather_panel
 from weather_api import WeatherAPIError, WeatherReading, WeatherSnapshot
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-NOW = datetime(2026, 11, 26, 3, 15, tzinfo=timezone.utc)
+NOW = datetime(2026, 11, 26, 3, 15, tzinfo=UTC)
 SITE = ("Khu công nghiệp thử nghiệm", 16.07, 108.22)
 OTHER_SITE = ("Điểm thử nghiệm thứ hai", 21.03, 105.85)
 

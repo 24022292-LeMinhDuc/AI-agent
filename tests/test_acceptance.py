@@ -16,7 +16,6 @@ from mapping import apply_mapping, suggest_mapping
 from report import build_report_data
 from tools import clean, enpi_regression, list_opportunities, seu_pareto, total_kwh
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 

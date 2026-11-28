@@ -11,7 +11,11 @@ import yaml
 import db
 from agent import run_tool
 from schemas import SCHEMAS, TOOLS
-from tools import energy_balance_analysis, tariff_and_power_quality_analysis
+from tools import (
+    energy_balance_analysis,
+    evaluate_ecm_financials,
+    tariff_and_power_quality_analysis,
+)
 
 
 @pytest.fixture
@@ -64,6 +68,26 @@ def test_tou_and_power_quality(observations, config):
     assert result["reactive_penalty_vnd"] == pytest.approx(315100 * (.9 / .8 - 1))
     assert result["compensation_kvar"] == pytest.approx(120 * (tan(acos(.8)) - tan(acos(.9))))
     json.dumps(result, allow_nan=False)
+
+
+def test_daily_context_label_cannot_establish_peak_load(config):
+    rows = pd.DataFrame({"timestamp": pd.date_range("2026-01-01", periods=3),
+                         "kwh_total": [10, 20, 30], "tariff_period": ["normal"] * 3})
+    result = tariff_and_power_quality_analysis(rows, config)
+    assert result["estimated_cost_vnd"] == 60 * 1738
+    assert result["shift_savings_vnd"] is None and result["peak_share_pct"] is None
+    assert any("theo ngày" in note for note in result["warnings"])
+
+
+def test_fuel_ecm_uses_configured_fuel_properties(config):
+    case = {"energy_carrier": "fuel", "fuel_type": "DO", "boiler_fuel_kg": 100,
+            "annual_kwh": 10, "kwh_total": 0}
+    result = evaluate_ecm_financials(case, {}, {}, fuel_properties=config["fuel_properties"])
+    assert result["ghg_scope1_tco2e"] == pytest.approx(100 * 0.043 * 74.1 / 1000)
+    assert result["annual_co2_saved_t"] == pytest.approx(10 * 0.0036 * 74.1 / 1000)
+    assert result["total_emissions_tco2e"] == result["ghg_scope1_tco2e"]
+    with pytest.raises(ValueError, match="fuel_properties"):
+        evaluate_ecm_financials(case, {}, {})
 
 
 def test_partial_data_keeps_missing_values_distinct_from_zero(config):

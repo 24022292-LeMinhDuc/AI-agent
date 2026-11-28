@@ -19,7 +19,6 @@ from mapping import (
     validate_mapped_data,
 )
 
-
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 EXPECTED_MAPPINGS = {
     "sample_a": {
@@ -122,6 +121,19 @@ def test_warns_about_legacy_chiller_unit_scale() -> None:
         warning["column"] == "Chiller_kWh" and "đơn vị" in warning["warning"]
         for warning in warnings
     )
+
+
+@pytest.mark.parametrize(("unit", "factor"), [("Wh", 0.001), ("MWh", 1000), ("GWh", 1_000_000)])
+def test_declared_energy_unit_requires_correct_conversion(unit, factor):
+    column = f"Chiller electricity {unit}"
+    raw = pd.DataFrame({"Ngay": ["2026-01-01"], column: [1500]})
+    mapping = suggest_mapping(raw, use_ai=False)
+    assert mapping[column] == "kwh_chiller"
+    issue, = detect_unit_issues(raw, mapping)
+    assert (issue["unit"], issue["factor"]) == (unit, factor)
+    with pytest.raises(ValueError, match=unit):
+        apply_mapping(raw, mapping, {})
+    assert apply_mapping(raw, mapping, {column: factor}).loc[0, "kwh_chiller"] == 1500 * factor
 
 
 def test_apply_mapping_renames_scales_drops_noise_and_adds_cdd() -> None:

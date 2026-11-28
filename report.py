@@ -6,7 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html import escape
 from io import BytesIO
 from typing import Any
@@ -20,7 +20,6 @@ import db
 from agent import run_tool
 from energy_baseline import BASELINE_DRIVER_LABELS
 from gemini_service import create_client, generate_content
-
 
 REPORT_TITLE = "Báo cáo kiểm toán năng lượng"
 FIXED_INTERPRETATION = (
@@ -57,7 +56,7 @@ def build_report_data(store: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Cần xác nhận mapping trước khi tạo báo cáo.")
     df = store.get("clean_df", store.get("df"))
     if not isinstance(df, pd.DataFrame):
-        raise ValueError("Không tìm thấy dữ liệu đã ánh xạ trong store.")
+        raise TypeError("Không tìm thấy dữ liệu đã ánh xạ trong store.")
 
     config = store.get("config", {})
     threshold = float(store.get("seu_threshold_value", config.get("seu_threshold", 0.8)))
@@ -156,8 +155,9 @@ def build_report_data(store: dict[str, Any]) -> dict[str, Any]:
     report_data = {
         "metadata": {
             "schema_version": 1,
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "generated_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
             "source_file": store.get("filename"),
+            "source_sha256": store.get("upload_fingerprint"),
             "source_sheet": store.get("upload_sheet"),
             "date_start": scope.get("date_start"),
             "date_end": scope.get("date_end"),
@@ -251,8 +251,8 @@ def generate_interpretation(report_data: dict[str, Any]) -> str:
         interpretation = (response.text or "").strip()
         if interpretation and not any(character.isdigit() for character in interpretation):
             return interpretation
-    except Exception:
-        pass
+    except (RuntimeError, ValueError):
+        return FIXED_INTERPRETATION
     return FIXED_INTERPRETATION
 
 
@@ -392,10 +392,10 @@ def _energy_balance_report_blocks(balance_run: dict[str, Any]) -> list[_ReportBl
         return blocks
 
     summary = [
-        f"Năng lượng đầu vào {_format_number(result.get('total_input_gj'))} GJ "
-        f"({_format_number(result.get('total_input_toe'), 3)} TOE)",
-        f"Hiệu suất lò hơi {_format_number(result.get('boiler_efficiency_pct'))}% "
-        f"({result.get('boiler_paired_rows', 0)} bản ghi ghép cặp)",
+        (f"Năng lượng đầu vào {_format_number(result.get('total_input_gj'))} GJ "
+         f"({_format_number(result.get('total_input_toe'), 3)} TOE)"),
+        (f"Hiệu suất lò hơi {_format_number(result.get('boiler_efficiency_pct'))}% "
+         f"({result.get('boiler_paired_rows', 0)} bản ghi ghép cặp)"),
         f"Chiller {_format_number(result.get('chiller_kw_per_rt'), 3)} kW/RT · "
         f"COP {_format_number(result.get('chiller_cop'))}"
         + (f" ({result['chiller_rating']})" if result.get("chiller_rating") else ""),
@@ -439,12 +439,12 @@ def _tariff_report_blocks(tariff_run: dict[str, Any]) -> list[_ReportBlock]:
 
     period_labels = {"peak": "Cao điểm", "normal": "Bình thường", "off_peak": "Thấp điểm"}
     summary = [
-        f"Chi phí TOU ước tính {_format_number(result.get('estimated_cost_vnd'), 0)} VNĐ "
-        f"(cao điểm {_format_number(result.get('peak_share_pct'))}%)",
+        (f"Chi phí TOU ước tính {_format_number(result.get('estimated_cost_vnd'), 0)} VNĐ "
+         f"(cao điểm {_format_number(result.get('peak_share_pct'))}%)"),
         f"Tiết kiệm ước tính khi dịch tải {_format_number(result.get('shift_savings_vnd'), 0)} VNĐ",
-        f"Công suất đỉnh {_format_number(result.get('peak_demand_kw'))} kW · "
-        f"Hệ số phụ tải {_format_number(result.get('load_factor'), 3)} · "
-        f"cos φ trung bình {_format_number(result.get('mean_power_factor'), 3)}",
+        (f"Công suất đỉnh {_format_number(result.get('peak_demand_kw'))} kW · "
+         f"Hệ số phụ tải {_format_number(result.get('load_factor'), 3)} · "
+         f"cos φ trung bình {_format_number(result.get('mean_power_factor'), 3)}"),
     ]
     if result.get("pf_rows"):
         summary.append(
@@ -490,6 +490,8 @@ def _report_sections(
     ]
     if metadata.get("source_sheet"):
         scope_rows.insert(2, ["Trang tính", metadata["source_sheet"]])
+    if metadata.get("source_sha256"):
+        scope_rows.append(["SHA-256 tệp nguồn", metadata["source_sha256"]])
     if metadata.get("total_source") == "metered_total":
         scope_rows.append(["Nguồn điện tổng", "Công tơ tổng trong tệp"])
     elif metadata.get("total_source") == "submeter_sum":

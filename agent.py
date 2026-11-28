@@ -19,7 +19,6 @@ from gemini_service import GeminiSession, create_client, error_message
 from schemas import SCHEMAS, TOOLS
 from verification import verify_results
 
-
 MAX_TOOL_ROUNDS = 6
 MAX_TOOL_CALLS = 16
 MAX_VERIFY_RETRIES = 2
@@ -155,7 +154,7 @@ def run_tool(name: str, args: dict[str, Any], store: dict[str, Any]) -> dict[str
                 config["tariff_vnd_per_kwh"],
                 config.get("emission_factor_kg_per_kwh"),
             )
-    except Exception as exc:
+    except (ArithmeticError, ValueError, TypeError, KeyError, IndexError) as exc:
         result = {"error": f"Không thể chạy công cụ {name}: {exc}"}
 
     run_id = db.log_run(name, args, result, scope_id=store.get("run_scope_id") or "")
@@ -237,7 +236,7 @@ def _verify_reply(
             ]
             try:
                 response = session.generate(contents=messages, config=repair_config)
-            except Exception as exc:
+            except (RuntimeError, ValueError) as exc:
                 failure = f"Lượt tự hiệu chỉnh bị gián đoạn. {error_message(exc)}"
                 break
             candidates = getattr(response, "candidates", None) or []
@@ -283,7 +282,7 @@ def ask(
 
     try:
         session = GeminiSession(create_client())
-    except Exception as exc:
+    except (RuntimeError, ValueError) as exc:
         return {"answer": error_message(exc), "run_ids": run_ids}
 
     contents: list[types.Content] = []
@@ -359,7 +358,7 @@ def ask(
     for _ in range(MAX_TOOL_ROUNDS):
         try:
             response = session.generate(contents=contents, config=config)
-        except Exception as exc:
+        except (RuntimeError, ValueError) as exc:
             return {"answer": error_message(exc), "run_ids": run_ids}
 
         candidates = getattr(response, "candidates", None) or []
@@ -407,7 +406,7 @@ def ask(
                 arguments = {}
             try:
                 tool_result = run_tool(name, arguments, store)
-            except Exception:
+            except (sqlite3.Error, OSError, ValueError, TypeError):
                 tool_result = {"error": f"Không thể chạy hoặc ghi vết công cụ {name}."}
             llm_tool_result = tool_result
             if "run_id" in tool_result:
